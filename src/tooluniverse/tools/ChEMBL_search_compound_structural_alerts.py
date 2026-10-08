@@ -10,7 +10,7 @@ from ._shared_client import get_shared_client
 
 def ChEMBL_search_compound_structural_alerts(
     molecule_chembl_id: Optional[str] = None,
-    alert_name__contains: Optional[str] = None,
+    alert__alert_name__icontains: Optional[str] = None,
     limit: Optional[int] = 20,
     offset: Optional[int] = 0,
     *,
@@ -25,12 +25,12 @@ def ChEMBL_search_compound_structural_alerts(
     ----------
     molecule_chembl_id : str
         Filter by molecule ChEMBL ID
-    alert_name__contains : str
-        Filter by alert name (contains)
+    alert__alert_name__icontains : str
+        Filter by alert name, case-insensitive substring (e.g. 'nitro'). The alert na...
     limit : int
-
+        Maximum number of results (default: 20, max: 1000)
     offset : int
-
+        Offset for pagination (default: 0)
     stream_callback : Callable, optional
         Callback for streaming output
     use_cache : bool, default False
@@ -49,7 +49,7 @@ def ChEMBL_search_compound_structural_alerts(
         k: v
         for k, v in {
             "molecule_chembl_id": molecule_chembl_id,
-            "alert_name__contains": alert_name__contains,
+            "alert__alert_name__icontains": alert__alert_name__icontains,
             "limit": limit,
             "offset": offset,
         }.items()

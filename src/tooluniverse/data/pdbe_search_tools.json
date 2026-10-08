@@ -1,7 +1,7 @@
 [
   {
     "name": "PDBeSearch_search_structures",
-    "description": "Search PDB structures through PDBe's Solr search interface by keyword, protein name, or gene name. Returns PDB IDs, titles, resolution, experimental methods, deposition dates, and organisms, sorted by resolution (best first). Complements RCSB PDB tools with powerful full-text search. Example: searching 'insulin' returns 400+ structures; 'BRCA1' returns 148 structures including BRCT domains.",
+    "description": "Search PDB structures through PDBe's Solr search interface by keyword, protein name, or gene name. Returns PDB IDs, titles, resolution, experimental methods, deposition dates, and organisms, sorted by relevance by default (best text match first, resolution as tie-breaker; sort_by='resolution' gives best-resolved first). Complements RCSB PDB tools with powerful full-text search. Example: searching 'insulin' returns 400+ structures; 'BRCA1' returns 148 structures including BRCT domains.",
     "parameter": {
       "type": "object",
       "properties": {
@@ -15,6 +15,15 @@
             "null"
           ],
           "description": "Maximum results to return (1-50, default 10)."
+        },
+        "sort_by": {
+          "type": "string",
+          "enum": [
+            "relevance",
+            "resolution"
+          ],
+          "default": "relevance",
+          "description": "Result ordering: 'relevance' (default) puts the best text match first with resolution as the tie-breaker; 'resolution' lists the best-resolved structures first, even if they only mention the query."
         }
       },
       "required": [
@@ -38,79 +47,51 @@
     "return_schema": {
       "oneOf": [
         {
-          "type": "object",
-          "properties": {
-            "data": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "pdb_id": {
-                    "type": "string"
-                  },
-                  "title": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "resolution": {
-                    "type": [
-                      "number",
-                      "null"
-                    ]
-                  },
-                  "experimental_method": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "deposition_date": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "number_of_entities": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ]
-                  },
-                  "organism": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pdb_id": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "resolution": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "experimental_method": {
+                "type": "array",
+                "items": {
+                  "type": "string"
                 }
-              }
-            },
-            "metadata": {
-              "type": "object",
-              "properties": {
-                "source": {
-                  "type": "string"
-                },
-                "total_found": {
-                  "type": "integer"
-                },
-                "returned": {
-                  "type": "integer"
-                },
-                "query": {
-                  "type": "string"
-                },
-                "endpoint": {
+              },
+              "deposition_date": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "number_of_entities": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "organism": {
+                "type": "array",
+                "items": {
                   "type": "string"
                 }
               }
             }
-          },
-          "required": [
-            "data"
-          ]
+          }
         },
         {
           "type": "object",
@@ -158,80 +139,58 @@
         {
           "type": "object",
           "properties": {
-            "data": {
-              "type": "object",
-              "properties": {
-                "compound_id": {
-                  "type": "string"
-                },
-                "name": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "formula": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "weight": {
-                  "type": [
-                    "number",
-                    "null"
-                  ]
-                },
-                "compound_type": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "inchi": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "inchi_key": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "smiles": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "systematic_name": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              }
+            "compound_id": {
+              "type": "string"
             },
-            "metadata": {
-              "type": "object",
-              "properties": {
-                "source": {
-                  "type": "string"
-                },
-                "query": {
-                  "type": "string"
-                },
-                "endpoint": {
-                  "type": "string"
-                }
-              }
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "formula": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "weight": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "compound_type": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "inchi": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "inchi_key": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "smiles": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "systematic_name": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
-          },
-          "required": [
-            "data"
-          ]
+          }
         },
         {
           "type": "object",
@@ -294,76 +253,45 @@
     "return_schema": {
       "oneOf": [
         {
-          "type": "object",
-          "properties": {
-            "data": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "pdb_id": {
-                    "type": "string"
-                  },
-                  "title": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "resolution": {
-                    "type": [
-                      "number",
-                      "null"
-                    ]
-                  },
-                  "experimental_method": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "deposition_date": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "organism": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pdb_id": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "resolution": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "experimental_method": {
+                "type": "array",
+                "items": {
+                  "type": "string"
                 }
-              }
-            },
-            "metadata": {
-              "type": "object",
-              "properties": {
-                "source": {
-                  "type": "string"
-                },
-                "total_found": {
-                  "type": "integer"
-                },
-                "returned": {
-                  "type": "integer"
-                },
-                "query": {
-                  "type": "string"
-                },
-                "organism_filter": {
-                  "type": "string"
-                },
-                "endpoint": {
+              },
+              "deposition_date": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "organism": {
+                "type": "array",
+                "items": {
                   "type": "string"
                 }
               }
             }
-          },
-          "required": [
-            "data"
-          ]
+          }
         },
         {
           "type": "object",

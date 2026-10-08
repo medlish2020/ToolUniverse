@@ -10,12 +10,16 @@ details' so callers see the same envelope as before.
 
 import json
 from typing import Any, Dict
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from tooluniverse.tool_registry import register_tool
 
 SPARQL_ENDPOINT = "https://sparql.wikipathways.org/sparql"
+GPML_URL = (
+    "https://www.wikipathways.org/wikipathways-assets/pathways/{wpid}/{wpid}.gpml"
+)
 _BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -49,6 +53,21 @@ def _wpid_from_uri(uri: str) -> str:
     """https://identifiers.org/wikipathways/WP254_r140926 -> WP254."""
     tail = uri.rstrip("/").rsplit("/", 1)[-1]
     return tail.split("_", 1)[0]
+
+
+def _fetch_gpml(wpid: str, timeout: int = 30) -> str:
+    """Fetch the raw GPML XML for a pathway from the static asset host.
+
+    WikiPathways serves each pathway's GPML at a predictable static path
+    (confirmed live: WP254.gpml, 200 with ~75 KB of XML); an unknown WPID
+    answers 404.
+    """
+    req = Request(
+        GPML_URL.format(wpid=wpid),
+        headers={"User-Agent": _BROWSER_UA, "Accept": "application/xml"},
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
 
 
 @register_tool(
@@ -86,6 +105,15 @@ class WikiPathwaysSearchTool:
         organism = arguments.get("organism")
         limit = int(arguments.get("limit", 20))
 
+        # Fix-11B-2: pathway titles in WikiPathways are typically unhyphenated
+        # gene/protein shorthand ("IL4 signaling"), but researchers naturally
+        # type the hyphenated form ("IL-4 signaling") -- confirmed live this
+        # returned zero results even though the pathway exists (WP395).
+        # Stripping hyphens from both sides of the CONTAINS comparison keeps
+        # the plain-substring search simple while absorbing this common
+        # notation mismatch.
+        query_norm = query.replace("-", "")
+
         organism_filter = (
             f'  FILTER(LCASE(STR(?organism)) = "{organism.lower()}")'
             if organism
@@ -98,7 +126,7 @@ SELECT DISTINCT ?pathway ?title ?organism WHERE {{
   ?pathway a wp:Pathway ;
            dc:title ?title ;
            wp:organismName ?organism .
-  FILTER(CONTAINS(LCASE(?title), "{query}"))
+  FILTER(CONTAINS(REPLACE(LCASE(?title), "-", ""), "{query_norm}"))
 {organism_filter}
 }} LIMIT {limit}
 """
@@ -156,6 +184,25 @@ class WikiPathwaysGetTool:
         wpid = (arguments.get("wpid") or "").upper().replace('"', "")
         if not wpid:
             return {"status": "error", "error": "wpid parameter is required"}
+
+        if (arguments.get("format") or "json") == "gpml":
+            # The "format" parameter used to be accepted but ignored: every
+            # call ran the JSON/SPARQL path below regardless of the value.
+            try:
+                gpml = _fetch_gpml(wpid, timeout=timeout)
+            except HTTPError as e:
+                if e.code == 404:
+                    return {
+                        "status": "error",
+                        "error": f"Pathway '{wpid}' has no GPML file (HTTP 404)",
+                    }
+                return {"status": "error", "error": f"WikiPathways GPML error: {e}"}
+            except Exception as e:
+                return {"status": "error", "error": f"WikiPathways GPML error: {e}"}
+            return {
+                "status": "success",
+                "data": {"wpid": wpid, "format": "gpml", "gpml": gpml},
+            }
 
         # The pathway URI ends with /<WPID>_r<revision>, and dc:identifier
         # is the un-revisioned identifiers.org URI. Filter on the URI pattern.

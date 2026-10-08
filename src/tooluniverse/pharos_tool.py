@@ -23,6 +23,32 @@ from .tool_registry import register_tool
 PHAROS_GRAPHQL_URL = "https://pharos-api.ncats.io/graphql"
 
 
+def _apply_top(targets, top, count):
+    """Return (targets truncated to ``top``, note or None).
+
+    Pharos' GraphQL API currently ignores ``top`` and ``skip`` and answers every
+    ``targets`` query with a fixed page of 10, so a larger ``top`` cannot be
+    honoured (checked live: top 2/5/50 and skip 0/3/10 all returned the same 10).
+    Truncating covers a smaller ``top``; the note covers the shortfall.
+    """
+    shown = list(targets)[: max(1, int(top))]
+    note = None
+    if len(shown) < min(int(top), count or 0):
+        note = (
+            f"Pharos returned {len(shown)} of {count} matching targets: its API "
+            "currently ignores top/skip and returns at most 10 per request. Narrow "
+            "the query (search term, disease or Target Development Level) to reach "
+            "the others."
+        )
+    return shown, note
+
+
+# How many associated diseases / ligands a single-target lookup samples. The
+# full totals always travel alongside as diseaseCounts / ligandCounts, so this
+# only bounds response size, never the reported counts.
+_TARGET_DETAIL_TOP = 10
+
+
 @register_tool("PharosTool")
 class PharosTool(BaseTool):
     """
@@ -104,54 +130,37 @@ class PharosTool(BaseTool):
         """
         Get detailed target information by gene symbol or UniProt ID.
 
-        Returns TDL classification, protein family, disease associations,
-        ligands, and druggability information.
+        Returns TDL classification (Pharos' druggability assessment), protein
+        family, disease associations, and ligand/drug counts plus a sample of
+        the target's ligands.
         """
-        gene = arguments.get("gene")
-        uniprot = arguments.get("uniprot")
+        q, label = self._resolve_target_q(arguments)
+        if q is None:
+            return {"status": "error", "error": label}
 
-        if not gene and not uniprot:
-            return {
-                "status": "error",
-                "error": "Either 'gene' or 'uniprot' parameter is required",
+        # Field names verified against the live schema by introspecting the
+        # Pharos GraphQL "Target" type (diseaseCounts/diseases: IntProp/Disease,
+        # ligandCounts/ligands: IntProp/Ligand; diseases and ligands both take a
+        # "top" argument) and by running this exact selection for FOLH1.
+        query = """
+        query GetTarget($q: ITarget!, $top: Int!) {
+            target(q: $q) {
+                name
+                sym
+                uniprot
+                tdl
+                fam
+                novelty
+                description
+                publicationCount
+                diseaseCounts { name value }
+                diseases(top: $top) { name associationCount mondoID }
+                ligandCounts { name value }
+                ligands(top: $top) { ligid name isdrug }
             }
-
-        # Use the target query with q parameter (ITarget input type)
-        # Simplified query for reliability
-        if uniprot:
-            query = """
-            query GetTarget($q: ITarget!) {
-                target(q: $q) {
-                    name
-                    sym
-                    uniprot
-                    tdl
-                    fam
-                    novelty
-                    description
-                    publicationCount
-                }
-            }
-            """
-            variables = {"q": {"uniprot": uniprot}}
-        else:
-            query = """
-            query GetTarget($q: ITarget!) {
-                target(q: $q) {
-                    name
-                    sym
-                    uniprot
-                    tdl
-                    fam
-                    novelty
-                    description
-                    publicationCount
-                }
-            }
-            """
-            variables = {"q": {"sym": gene}}
-
-        result = self._execute_graphql(query, variables)
+        }
+        """
+        result = self._execute_graphql(query, {"q": q, "top": _TARGET_DETAIL_TOP})
 
         if result["status"] == "success":
             target = result["data"].get("target")
@@ -159,8 +168,17 @@ class PharosTool(BaseTool):
                 return {
                     "status": "success",
                     "data": None,
-                    "message": f"No target found for {'UniProt ' + uniprot if uniprot else 'gene ' + gene}",
+                    "message": f"No target found for {label}",
                 }
+            # diseaseCounts/ligandCounts are whole-target totals; the diseases and
+            # ligands lists are only the top _TARGET_DETAIL_TOP entries, so say so
+            # rather than letting a caller read the sample as the full set.
+            target["disease_count"] = len(target.get("diseaseCounts") or [])
+            target["ligands_note"] = (
+                f"'diseases' and 'ligands' list at most {_TARGET_DETAIL_TOP} "
+                "entries; 'diseaseCounts'/'ligandCounts' give the full totals. "
+                "Use Pharos_get_target_ligands for ligand bioactivity values."
+            )
             result["data"] = target
 
         return result
@@ -215,10 +233,12 @@ class PharosTool(BaseTool):
 
         if result["status"] == "success":
             targets_data = result["data"].get("targets", {})
-            result["data"] = {
-                "count": targets_data.get("count", 0),
-                "targets": targets_data.get("targets", []),
-            }
+            shown, note = _apply_top(
+                targets_data.get("targets", []), top, targets_data.get("count", 0)
+            )
+            result["data"] = {"count": targets_data.get("count", 0), "targets": shown}
+            if note:
+                result["data"]["note"] = note
 
         return result
 
@@ -313,11 +333,16 @@ class PharosTool(BaseTool):
 
         if result["status"] == "success":
             targets_data = result["data"].get("targets", {})
+            shown, note = _apply_top(
+                targets_data.get("targets", []), top, targets_data.get("count", 0)
+            )
             result["data"] = {
                 "disease": disease,
                 "count": targets_data.get("count", 0),
-                "targets": targets_data.get("targets", []),
+                "targets": shown,
             }
+            if note:
+                result["data"]["note"] = note
 
         return result
 

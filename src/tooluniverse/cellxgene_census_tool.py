@@ -219,7 +219,7 @@ class CELLxGENECensusTool(BaseTool):
                     "nnz": presence_matrix.nnz,
                     "density": presence_matrix.nnz
                     / (presence_matrix.shape[0] * presence_matrix.shape[1]),
-                    "message": "Presence matrix retrieved. Shape: (genes, datasets)",
+                    "message": "Presence matrix retrieved. Shape: (datasets, genes)",
                 }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -243,8 +243,8 @@ class CELLxGENECensusTool(BaseTool):
                             "The cellxgene_census.experimental module for embeddings is no longer available "
                             "in cellxgene_census >= 1.17.0. Pre-calculated embeddings (scVI, Geneformer) "
                             "can be accessed via the obs_embedding obsm slots when querying AnnData objects. "
-                            "Use CELLxGENE_query_cells with the embedding coordinate columns to retrieve "
-                            "cell embeddings directly."
+                            "Use CELLxGENE_get_cell_metadata with the embedding coordinate columns to "
+                            "retrieve cell embeddings directly."
                         ),
                         "organism": organism,
                         "embedding_name": embedding_name,

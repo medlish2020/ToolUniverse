@@ -26,6 +26,7 @@ Tool Discovery & Usage
 ----------------------
 
 * **Tool Discovery** → :doc:`finding_tools` - Tutorial to ToolUniverse's three tool finder methods: keyword, LLM, and embedding search
+* **Protein Model Outputs** → :doc:`protein_model_outputs` - Read NVIDIA sequence and structure predictions, preserve all samples, and distinguish model failures
 * **Tools Overview** → :doc:`tools` - Comprehensive overview of all available tools
 
 AI Agent Platform Setup
@@ -38,6 +39,7 @@ LLM Providers
 
 * **vLLM Support** → :doc:`vllm_support` - Use self-hosted LLM models with vLLM for high-performance inference
 * **OpenRouter Support** → :doc:`openrouter_support` - Access multiple LLM providers through OpenRouter API
+* **OpenAI-Compatible Support** → :doc:`openai_compatible_support` - Use OpenAI and compatible chat-completions endpoints
 
 Advanced Features
 -----------------

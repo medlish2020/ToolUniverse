@@ -58,7 +58,9 @@ def test_tsv_body_parsed_into_row_dicts():
     assert result["data"][0] == {
         "Input m/z": "386.354865",
         "Matched m/z": "386.3549",
-        "Delta": ".0000",
+        # Metabolomics Workbench's own endpoint omits the leading zero
+        # (".0000"); the tool now restores it to valid numeric-string syntax.
+        "Delta": "0.0000",
         "Name": "5alpha-Cholestanone",
         "Formula": "C27H46O",
     }
@@ -78,9 +80,12 @@ def test_non_tabular_text_falls_back_to_raw_string():
     assert result["data"] == "Service temporarily unavailable, please try again later."
 
 
-def test_single_line_text_falls_back_to_raw_string():
-    """A single line (header only, no data rows) isn't a real table --
-    fall back rather than returning an empty/misleading parse."""
+def test_single_tabbed_line_is_a_header_with_zero_rows_not_a_raw_string():
+    """A single tab-delimited line is the shared header moverz sends back when
+    a search has no matches (confirmed live: tolerance 0.0001 around m/z
+    180.0634) -- zero rows, not "not a table". Returns [], matching the type
+    every other zero-result path in this tool already returns, instead of
+    handing back the literal header line as a string."""
     tool = _tool("exactmass")
     resp = _resp("Input m/z\tMatched m/z\tName")
 
@@ -88,7 +93,7 @@ def test_single_line_text_falls_back_to_raw_string():
         result = tool.run({"mass_value": 100.0})
 
     assert result["status"] == "success"
-    assert result["data"] == "Input m/z\tMatched m/z\tName"
+    assert result["data"] == []
 
 
 def test_genuine_json_response_unaffected():

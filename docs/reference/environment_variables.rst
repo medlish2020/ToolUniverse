@@ -54,6 +54,18 @@ Control ToolUniverse's two-tier caching system (in-memory LRU + SQLite persisten
    * - ``TOOLUNIVERSE_CACHE_ASYNC_PERSIST``
      - ``true``
      - Write to SQLite on background thread for non-blocking I/O. Set to ``false`` for immediate disk persistence.
+   * - ``TOOLUNIVERSE_CREDENTIAL_INSTANCE_CACHE_SIZE``
+     - ``256``
+     - Maximum BYOK credential-partitioned tool instances retained per ``ToolUniverse`` object. ``0`` disables reuse.
+   * - ``TOOLUNIVERSE_CREDENTIAL_INSTANCE_CACHE_TTL``
+     - ``900``
+     - Idle lifetime in seconds for BYOK tool instances. ``0`` disables reuse and constructs an instance for every call.
+   * - ``TOOLUNIVERSE_HTTP_POOL_CONNECTIONS``
+     - ``64``
+     - Number of host connection pools retained by the identity-free shared REST transport.
+   * - ``TOOLUNIVERSE_HTTP_POOL_MAXSIZE``
+     - ``64``
+     - Reusable TCP/TLS connections retained per host by the shared REST transport.
 
 **Examples**::
 
@@ -69,6 +81,10 @@ Control ToolUniverse's two-tier caching system (in-memory LRU + SQLite persisten
    
    # Synchronous writes for critical data
    export TOOLUNIVERSE_CACHE_ASYNC_PERSIST=false
+
+   # Keep up to 128 isolated BYOK clients for 10 minutes of inactivity
+   export TOOLUNIVERSE_CREDENTIAL_INSTANCE_CACHE_SIZE=128
+   export TOOLUNIVERSE_CREDENTIAL_INSTANCE_CACHE_TTL=600
 
 **See also**: :doc:`../guide/cache_system` for complete caching guide.
 
@@ -157,13 +173,16 @@ Configure Large Language Model providers for agentic tools and LLM-powered featu
      - Description
    * - ``TOOLUNIVERSE_LLM_DEFAULT_PROVIDER``
      - (none)
-     - Default LLM provider: ``openai``, ``azure``, ``gemini``, ``anthropic``
+     - Default LLM provider: ``CHATGPT``, ``OPENAI``, ``OPENROUTER``, ``GEMINI``, ``VLLM``
    * - ``TOOLUNIVERSE_LLM_CONFIG_MODE``
      - ``default``
      - LLM configuration mode. Use ``default`` or custom profiles.
    * - ``TOOLUNIVERSE_LLM_TEMPERATURE``
      - (varies)
      - Temperature for LLM sampling (0.0-1.0). Higher = more creative.
+   * - ``TOOLUNIVERSE_LLM_RETURN_JSON``
+     - ``false``
+     - Request structured JSON output. Accepts ``true``/``false``, ``1``/``0``, ``yes``/``no``, or ``on``/``off``.
    * - ``TOOLUNIVERSE_LLM_MODEL_DEFAULT``
      - (provider default)
      - Default model ID when not task-specific.
@@ -174,7 +193,7 @@ Configure Large Language Model providers for agentic tools and LLM-powered featu
 **Examples**::
 
    # Use OpenAI for all LLM tasks
-   export TOOLUNIVERSE_LLM_DEFAULT_PROVIDER=openai
+   export TOOLUNIVERSE_LLM_DEFAULT_PROVIDER=OPENAI
    export TOOLUNIVERSE_LLM_MODEL_DEFAULT=gpt-4o-mini
    
    # Task-specific models
@@ -184,6 +203,10 @@ Configure Large Language Model providers for agentic tools and LLM-powered featu
    # Adjust temperature
    export TOOLUNIVERSE_LLM_TEMPERATURE=0.2
 
+   # Force structured JSON output when environment values take priority
+   export TOOLUNIVERSE_LLM_CONFIG_MODE=env_override
+   export TOOLUNIVERSE_LLM_RETURN_JSON=true
+
 **Use cases**:
 
 - **Agentic Tools**: Tools that use LLMs internally (e.g., Tool_Finder_LLM, summarization tools)
@@ -191,6 +214,28 @@ Configure Large Language Model providers for agentic tools and LLM-powered featu
 - **Custom Tools**: Your own tools that leverage LLM capabilities
 
 **See also**: Provider-specific API keys in :doc:`../guide/api_keys`.
+
+OpenAI-compatible variables:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 15 50
+
+   * - Variable
+     - Default
+     - Description
+   * - ``OPENAI_API_KEY``
+     - (none)
+     - API key for OpenAI or an OpenAI-compatible endpoint.
+   * - ``OPENAI_BASE_URL``
+     - SDK default
+     - Optional OpenAI-compatible API base URL.
+   * - ``OPENAI_MAX_TOKENS_BY_MODEL``
+     - (none)
+     - JSON mapping of model IDs or prefixes to default max output tokens.
+   * - ``OPENAI_DEFAULT_MODEL_LIMITS``
+     - built-in
+     - JSON mapping that extends or overrides built-in model-family defaults.
 
 Performance & System
 --------------------
@@ -306,7 +351,7 @@ See: :doc:`../guide/api_keys`
    # NCBI (3x faster PubMed access)
    NCBI_API_KEY=your_key_here
    
-   # Semantic Scholar (no rate limits)
+   # Semantic Scholar (isolated authenticated quota)
    SEMANTIC_SCHOLAR_API_KEY=your_key_here
    
    # NVIDIA NIM (protein structure prediction)
@@ -548,11 +593,23 @@ Complete Variable List
    * - ``TOOLUNIVERSE_LLM_TEMPERATURE``
      - (varies)
      - LLM
+   * - ``TOOLUNIVERSE_LLM_RETURN_JSON``
+     - false
+     - LLM
    * - ``TOOLUNIVERSE_LLM_MODEL_DEFAULT``
      - (provider default)
      - LLM
    * - ``TOOLUNIVERSE_LLM_MODEL_{TASK}``
      - (none)
+     - LLM
+   * - ``OPENAI_BASE_URL``
+     - SDK default
+     - LLM
+   * - ``OPENAI_MAX_TOKENS_BY_MODEL``
+     - (none)
+     - LLM
+   * - ``OPENAI_DEFAULT_MODEL_LIMITS``
+     - built-in
      - LLM
    * - ``TOOLUNIVERSE_THREAD_POOL_SIZE``
      - 20
