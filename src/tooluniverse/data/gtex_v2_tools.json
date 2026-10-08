@@ -11,7 +11,8 @@
           "enum": [
             "get_median_gene_expression"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_median_gene_expression"
         },
         "gencode_id": {
           "type": [
@@ -109,7 +110,10 @@
         "operation": "get_median_gene_expression",
         "gencode_id": "ENSG00000141510.18"
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_median_gene_expression"
+    }
   },
   {
     "name": "GTEx_get_tissue_sites",
@@ -123,7 +127,8 @@
           "enum": [
             "get_tissue_sites"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_tissue_sites"
         },
         "dataset_id": {
           "type": "string",
@@ -383,7 +388,10 @@
       {
         "operation": "get_tissue_sites"
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_tissue_sites"
+    }
   },
   {
     "name": "GTEx_get_eqtl_genes",
@@ -397,7 +405,8 @@
           "enum": [
             "get_eqtl_genes"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_eqtl_genes"
         },
         "tissue_site_detail_id": {
           "type": "array",
@@ -419,13 +428,15 @@
         "page": {
           "type": "integer",
           "minimum": 0,
-          "default": 0
+          "default": 0,
+          "description": "Page number (0-based)"
         },
         "items_per_page": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100000,
-          "default": 250
+          "default": 250,
+          "description": "Results per page"
         }
       },
       "required": []
@@ -490,7 +501,10 @@
           "Whole_Blood"
         ]
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_eqtl_genes"
+    }
   },
   {
     "name": "GTEx_get_single_tissue_eqtls",
@@ -504,7 +518,8 @@
           "enum": [
             "get_single_tissue_eqtls"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_single_tissue_eqtls"
         },
         "gencode_id": {
           "type": "array",
@@ -534,18 +549,21 @@
             "gtex_v10",
             "gtex_snrnaseq_pilot"
           ],
-          "default": "gtex_v8"
+          "default": "gtex_v8",
+          "description": "GTEx dataset version (default gtex_v8)"
         },
         "page": {
           "type": "integer",
           "minimum": 0,
-          "default": 0
+          "default": 0,
+          "description": "Page number (0-based)"
         },
         "items_per_page": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100000,
-          "default": 250
+          "default": 250,
+          "description": "Results per page"
         }
       },
       "required": []
@@ -625,7 +643,10 @@
           "Whole_Blood"
         ]
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_single_tissue_eqtls"
+    }
   },
   {
     "name": "GTEx_calculate_eqtl",
@@ -639,7 +660,8 @@
           "enum": [
             "calculate_eqtl"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "calculate_eqtl"
         },
         "gencode_id": {
           "type": "string",
@@ -660,7 +682,8 @@
             "gtex_v10",
             "gtex_snrnaseq_pilot"
           ],
-          "default": "gtex_v8"
+          "default": "gtex_v8",
+          "description": "GTEx dataset version (default gtex_v8)"
         }
       },
       "required": [
@@ -763,7 +786,10 @@
         "tissue_site_detail_id": "Whole_Blood",
         "dataset_id": "gtex_v8"
       }
-    ]
+    ],
+    "fields": {
+      "operation": "calculate_eqtl"
+    }
   },
   {
     "name": "GTEx_get_top_expressed_genes",
@@ -777,7 +803,8 @@
           "enum": [
             "get_top_expressed_genes"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_top_expressed_genes"
         },
         "tissue_site_detail_id": {
           "type": "string",
@@ -795,18 +822,21 @@
             "gtex_v10",
             "gtex_snrnaseq_pilot"
           ],
-          "default": "gtex_v8"
+          "default": "gtex_v8",
+          "description": "GTEx dataset version (default gtex_v8)"
         },
         "page": {
           "type": "integer",
           "minimum": 0,
-          "default": 0
+          "default": 0,
+          "description": "Page number (0-based)"
         },
         "items_per_page": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100000,
-          "default": 250
+          "default": 250,
+          "description": "Results per page"
         }
       },
       "required": [
@@ -863,7 +893,10 @@
         "tissue_site_detail_id": "Liver",
         "items_per_page": 50
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_top_expressed_genes"
+    }
   },
   {
     "name": "GTEx_get_dataset_info",
@@ -877,7 +910,8 @@
           "enum": [
             "get_dataset_info"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_dataset_info"
         },
         "dataset_id": {
           "type": "string",
@@ -984,12 +1018,15 @@
       {
         "operation": "get_dataset_info"
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_dataset_info"
+    }
   },
   {
     "name": "GTEx_get_gene_expression",
     "type": "GTExV2Tool",
-    "description": "Get gene expression data at individual sample level (not aggregated). Returns normalized expression values (TPM) for each sample, allowing detailed distribution analysis. Can subset by donor attributes (sex, age_bracket) for demographic-specific analysis. Much more data than median expression. Use for: expression variability analysis, outlier detection, sample-level QC, demographic comparisons. Warning: large result sets for multiple genes/tissues.",
+    "description": "Get gene expression data at individual sample level (not aggregated). Returns normalized expression values (TPM) for each sample, allowing detailed distribution analysis. Can subset by donor attributes (sex, age_bracket) for demographic-specific analysis -- NOTE (checked 2026-09-22): attribute_subset only takes effect with dataset_id='gtex_v10'; with the default 'gtex_v8' the API silently ignores it and returns one unstratified row (subsetGroup: null) regardless of the value given. Much more data than median expression. Use for: expression variability analysis, outlier detection, sample-level QC, demographic comparisons. Warning: large result sets for multiple genes/tissues.",
     "parameter": {
       "type": "object",
       "properties": {
@@ -998,7 +1035,8 @@
           "enum": [
             "get_gene_expression"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_gene_expression"
         },
         "gencode_id": {
           "type": [
@@ -1023,7 +1061,7 @@
             "sex",
             "ageBracket"
           ],
-          "description": "Optional: Subset by donor sex or age bracket"
+          "description": "Optional: Subset by donor sex or age bracket. Only works with dataset_id='gtex_v10'; the default gtex_v8 dataset ignores this parameter."
         },
         "dataset_id": {
           "type": "string",
@@ -1032,18 +1070,21 @@
             "gtex_v10",
             "gtex_snrnaseq_pilot"
           ],
-          "default": "gtex_v8"
+          "default": "gtex_v8",
+          "description": "GTEx dataset version (default gtex_v8)"
         },
         "page": {
           "type": "integer",
           "minimum": 0,
-          "default": 0
+          "default": 0,
+          "description": "Page number (0-based)"
         },
         "items_per_page": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100000,
-          "default": 250
+          "default": 250,
+          "description": "Results per page"
         }
       },
       "required": [
@@ -1107,9 +1148,13 @@
         "tissue_site_detail_id": [
           "Liver"
         ],
-        "attribute_subset": "sex"
+        "attribute_subset": "sex",
+        "dataset_id": "gtex_v10"
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_gene_expression"
+    }
   },
   {
     "name": "GTEx_get_sample_info",
@@ -1123,7 +1168,8 @@
           "enum": [
             "get_sample_info"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_sample_info"
         },
         "sample_id": {
           "type": "array",
@@ -1176,18 +1222,21 @@
             "gtex_v10",
             "gtex_snrnaseq_pilot"
           ],
-          "default": "gtex_v8"
+          "default": "gtex_v8",
+          "description": "GTEx dataset version (default gtex_v8)"
         },
         "page": {
           "type": "integer",
           "minimum": 0,
-          "default": 0
+          "default": 0,
+          "description": "Page number (0-based)"
         },
         "items_per_page": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100000,
-          "default": 250
+          "default": 250,
+          "description": "Results per page"
         }
       },
       "required": []
@@ -1290,7 +1339,10 @@
         "sex": "female",
         "items_per_page": 10
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_sample_info"
+    }
   },
   {
     "name": "GTEx_get_multi_tissue_eqtls",
@@ -1304,7 +1356,8 @@
           "enum": [
             "get_multi_tissue_eqtls"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_multi_tissue_eqtls"
         },
         "gencode_id": {
           "type": "string",
@@ -1321,18 +1374,21 @@
             "gtex_v10",
             "gtex_snrnaseq_pilot"
           ],
-          "default": "gtex_v8"
+          "default": "gtex_v8",
+          "description": "GTEx dataset version (default gtex_v8)"
         },
         "page": {
           "type": "integer",
           "minimum": 0,
-          "default": 0
+          "default": 0,
+          "description": "Page number (0-based)"
         },
         "items_per_page": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100000,
-          "default": 250
+          "default": 250,
+          "description": "Results per page"
         }
       },
       "required": [
@@ -2223,7 +2279,10 @@
         "operation": "get_multi_tissue_eqtls",
         "gencode_id": "ENSG00000141510.16"
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_multi_tissue_eqtls"
+    }
   },
   {
     "name": "GTEx_get_single_tissue_sqtls",
@@ -2237,7 +2296,8 @@
           "enum": [
             "get_single_tissue_sqtls"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_single_tissue_sqtls"
         },
         "result_type": {
           "type": "string",
@@ -2390,7 +2450,10 @@
         ],
         "items_per_page": 5
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_single_tissue_sqtls"
+    }
   },
   {
     "name": "GTEx_get_median_transcript_expression",
@@ -2404,7 +2467,8 @@
           "enum": [
             "get_median_transcript_expression"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_median_transcript_expression"
         },
         "gencode_id": {
           "type": [
@@ -2509,7 +2573,10 @@
         ],
         "items_per_page": 3
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_median_transcript_expression"
+    }
   },
   {
     "name": "GTEx_get_single_nucleus_expression",
@@ -2523,7 +2590,8 @@
           "enum": [
             "get_single_nucleus_expression"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_single_nucleus_expression"
         },
         "result_type": {
           "type": "string",
@@ -2703,7 +2771,10 @@
         ],
         "items_per_page": 5
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_single_nucleus_expression"
+    }
   },
   {
     "name": "GTEx_get_finemapping_and_independent_eqtl",
@@ -2717,7 +2788,8 @@
           "enum": [
             "get_finemapping_and_independent_eqtl"
           ],
-          "description": "Operation type"
+          "description": "Operation type",
+          "default": "get_finemapping_and_independent_eqtl"
         },
         "result_type": {
           "type": "string",
@@ -2882,6 +2954,9 @@
         "gencode_id": "ENSG00000164308.16",
         "items_per_page": 3
       }
-    ]
+    ],
+    "fields": {
+      "operation": "get_finemapping_and_independent_eqtl"
+    }
   }
 ]

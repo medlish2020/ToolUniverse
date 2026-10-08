@@ -7,8 +7,12 @@ and retrieving accession numbers.
 """
 
 from typing import Dict, Any
-from .ncbi_eutils_tool import NCBIEUtilsTool
+from .ncbi_eutils_tool import NCBIEUtilsTool, esearch_query_disclosure
 from .tool_registry import register_tool
+
+
+# Friendly sort names -> NCBI nuccore sort schemas (verified against esearch).
+_NCBI_SORT = {"pub_date": "Date Released", "length": "Sequence Length"}
 
 
 @register_tool("NCBINucleotideSearchTool")
@@ -105,8 +109,13 @@ class NCBINucleotideSearchTool(NCBIEUtilsTool):
                 "term": search_term,
                 "retmode": "json",
                 "retmax": arguments.get("limit") or arguments.get("max_results") or 20,
-                "sort": arguments.get("sort", "relevance"),
             }
+            # NCBI names its sort schemas differently ("Date Released", "Sequence
+            # Length") and ignores unknown ones with a warning, so pub_date and
+            # title used to have no effect. Relevance is esearch's default.
+            sort = _NCBI_SORT.get(arguments.get("sort", "relevance"))
+            if sort:
+                params["sort"] = sort
 
             result = self._make_request("/esearch.fcgi", params)
 
@@ -143,15 +152,26 @@ class NCBINucleotideSearchTool(NCBIEUtilsTool):
                     except Exception:
                         pass
 
+                payload = {
+                    "uids": uids,
+                    "accessions": accessions,
+                    "count": count,
+                    "returned": len(uids),
+                    "search_term": search_term,
+                }
+                # Fix-54A-1: ``search_term`` echoed back the term as SUBMITTED,
+                # not the term nuccore ran. esearch drops phrases it cannot
+                # match and answers the remainder, so this field asserted a
+                # query that was not executed. Measured: term
+                # "BRCA1 zzzqqqxyz nonexistentterm12345" returned count 66893
+                # -- identical to "BRCA1" alone -- with both nonsense phrases
+                # in errorlist.phrasesnotfound and nothing said about it.
+                disclosure = esearch_query_disclosure(esearch_result, source="nuccore")
+                if disclosure:
+                    payload["query_disclosure"] = disclosure
                 return {
                     "status": "success",
-                    "data": {
-                        "uids": uids,
-                        "accessions": accessions,
-                        "count": count,
-                        "returned": len(uids),
-                        "search_term": search_term,
-                    },
+                    "data": payload,
                     "total_count": count,
                     "url": result.get("url"),
                 }

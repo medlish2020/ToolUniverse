@@ -5,10 +5,21 @@ This tool provides access to the MetaboLights database, the largest repository
 of metabolomics experiments and raw data.
 """
 
+import csv
+import io
+import re
 import requests
 from typing import Any, Dict
 from .base_tool import BaseTool
 from .tool_registry import register_tool
+
+# MetaboLights' own /ws/studies endpoint ignores keyword queries; EBI Search
+# indexes the same studies and honours them.
+EBI_SEARCH_URL = "https://www.ebi.ac.uk/ebisearch/ws/rest/metabolights"
+
+# Public archive copy of each study's ISA-Tab files (sample sheet s_<id>.txt).
+SAMPLE_TABLE_BASE = "https://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public"
+MAX_SAMPLE_ROWS = 1000
 
 
 @register_tool("MetaboLightsRESTTool")
@@ -55,9 +66,6 @@ class MetaboLightsRESTTool(BaseTool):
             if study_id:
                 return f"{self.base_url}/studies/{study_id}"
 
-        elif tool_name == "metabolights_search_studies":
-            return f"{self.base_url}/studies"
-
         elif tool_name == "metabolights_get_study_assays":
             study_id = args.get("study_id", "")
             if study_id:
@@ -80,15 +88,7 @@ class MetaboLightsRESTTool(BaseTool):
         params = {}
         tool_name = self.tool_config.get("name", "")
 
-        if tool_name == "metabolights_search_studies":
-            if "query" in args:
-                params["query"] = args["query"]
-            if "size" in args:
-                params["size"] = args["size"]
-            if "page" in args:
-                params["page"] = args["page"]
-
-        elif tool_name == "metabolights_list_studies":
+        if tool_name == "metabolights_list_studies":
             if "size" in args:
                 params["size"] = args["size"]
             if "page" in args:
@@ -105,51 +105,31 @@ class MetaboLightsRESTTool(BaseTool):
 
         return params
 
-    def _extract_samples_from_study(self, study_id: str) -> Dict[str, Any]:
-        """Extract sample information from study endpoint as fallback"""
+    def _samples_from_sample_table(self, study_id: str) -> Dict[str, Any]:
+        """Read the study's ISA-Tab sample table (s_<id>.txt) from the public archive.
+
+        The /studies/{id}/samples endpoint answers HTTP 400 ("not a valid TSV or CSV
+        file") for every study, and the study record carries no sample rows, so the
+        archive copy of the sample sheet is the only place the samples can be read.
+        """
+        if not re.fullmatch(r"MTBLS\d+", study_id):
+            return {"error": f"'{study_id}' is not a MetaboLights study ID like MTBLS1"}
+        url = f"{SAMPLE_TABLE_BASE}/{study_id}/s_{study_id}.txt"
         try:
-            study_url = f"{self.base_url}/studies/{study_id}"
-            response = self.session.get(study_url, timeout=self.timeout)
+            response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
-            study_data = response.json()
-
-            samples_info = {
-                "samples": [],
-                "note": "Samples extracted from study endpoint (samples API endpoint unavailable)",
-            }
-
-            # Extract samples from ISA investigation structure
-            if "isaInvestigation" in study_data:
-                isa = study_data["isaInvestigation"]
-
-                # Check studies array for materials/samples
-                if "studies" in isa and isinstance(isa["studies"], list):
-                    for study_item in isa["studies"]:
-                        if isinstance(study_item, dict):
-                            # Check for materials (samples)
-                            if "materials" in study_item:
-                                materials = study_item["materials"]
-                                if isinstance(materials, list):
-                                    for material in materials:
-                                        if isinstance(material, dict):
-                                            samples_info["samples"].append(material)
-
-                            # Check for samples directly
-                            if "samples" in study_item:
-                                samples = study_item["samples"]
-                                if isinstance(samples, list):
-                                    for sample in samples:
-                                        if isinstance(sample, dict):
-                                            samples_info["samples"].append(sample)
-
-            samples_info["count"] = len(samples_info["samples"])
-            return samples_info
-
+            rows = list(csv.DictReader(io.StringIO(response.text), delimiter="\t"))
         except Exception as e:
-            return {
-                "status": "error",
-                "error": f"Failed to extract samples from study endpoint: {str(e)}",
-            }
+            return {"error": f"Could not read the sample table {url}: {e}"}
+        return {
+            "samples": rows[:MAX_SAMPLE_ROWS],
+            "total_count": len(rows),
+            "url": url,
+            "note": (
+                "Samples read from the study's public ISA-Tab sample sheet "
+                "(the /samples API endpoint is unavailable)"
+            ),
+        }
 
     def _extract_files_from_study(self, study_id: str) -> Dict[str, Any]:
         """Extract file information from study endpoint as fallback"""
@@ -214,9 +194,71 @@ class MetaboLightsRESTTool(BaseTool):
                 "error": f"Failed to extract files from study endpoint: {str(e)}",
             }
 
+    def _search_via_ebi_search(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Keyword-search MetaboLights studies through EBI Search.
+
+        MetaboLights' own /ws/studies endpoint accepts a `query` parameter and
+        silently ignores it, so every search returned the same first N study
+        accessions by ID with status "success" -- a wrong answer that looked
+        like a right one. EBI Search indexes the same MetaboLights studies and
+        does honour the query (confirmed live: "acylcarnitine" -> 113 hits).
+        """
+        query = str(arguments.get("query", "")).strip()
+        size = arguments.get("size", 20)
+        page = arguments.get("page", 0)
+        params = {
+            "query": query,
+            "format": "json",
+            "size": size,
+            "start": int(page) * int(size),
+        }
+        # EBI Search's first response for an uncached query regularly exceeds
+        # 30s while warm repeats return in ~1s, so retry once before failing.
+        try:
+            response = self.session.get(
+                EBI_SEARCH_URL, params=params, timeout=self.timeout
+            )
+        except requests.exceptions.Timeout:
+            response = self.session.get(
+                EBI_SEARCH_URL, params=params, timeout=self.timeout * 2
+            )
+        response.raise_for_status()
+        payload = response.json()
+        entries = payload.get("entries", []) or []
+        result = {
+            "status": "success",
+            "data": [e.get("id") for e in entries if e.get("id")],
+            "url": response.url,
+            "count": len(entries),
+            "total_hits": payload.get("hitCount", 0),
+        }
+        if not entries:
+            suggested = payload.get("suggestedQuery")
+            result["note"] = (
+                f"No MetaboLights study matched '{query}'."
+                + (f" Did you mean '{suggested}'?" if suggested else "")
+                + " Use metabolights_list_studies to browse all public studies."
+            )
+        return result
+
     def run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute the MetaboLights API call"""
         tool_name = self.tool_config.get("name", "")
+
+        if tool_name == "metabolights_search_studies":
+            if not str(arguments.get("query", "")).strip():
+                return {
+                    "status": "error",
+                    "error": "query is required. To browse all public studies without "
+                    "a keyword, use metabolights_list_studies.",
+                }
+            try:
+                return self._search_via_ebi_search(arguments)
+            except (requests.RequestException, ValueError) as e:
+                return {
+                    "status": "error",
+                    "error": f"MetaboLights search via EBI Search failed: {str(e)}",
+                }
 
         if tool_name == "metabolights_get_reference_compound":
             if (
@@ -242,23 +284,24 @@ class MetaboLightsRESTTool(BaseTool):
             ):
                 study_id = arguments.get("study_id", "")
                 if study_id:
-                    # Try to extract samples from study endpoint
-                    fallback_data = self._extract_samples_from_study(study_id)
+                    fallback_data = self._samples_from_sample_table(study_id)
 
                     if "error" not in fallback_data:
+                        samples = fallback_data["samples"]
                         return {
                             "status": "success",
-                            "data": fallback_data.get("samples", []),
-                            "url": url,
-                            "count": fallback_data.get("count", 0),
-                            "note": fallback_data.get("note", ""),
+                            "data": samples,
+                            "url": fallback_data["url"],
+                            "count": len(samples),
+                            "total_count": fallback_data["total_count"],
+                            "truncated": fallback_data["total_count"] > len(samples),
+                            "note": fallback_data["note"],
                             "fallback_used": True,
-                            "original_error": "Samples endpoint returned 400 error, used study endpoint fallback",
                         }
                     else:
                         return {
                             "status": "error",
-                            "error": f"Samples endpoint returned 400 error for study {study_id}. Fallback to study endpoint also failed.",
+                            "error": f"Samples endpoint returned 400 error for study {study_id}. {fallback_data['error']}",
                             "url": url,
                             "suggestion": f"Access samples via MetaboLights website: https://www.ebi.ac.uk/metabolights/studies/{study_id}",
                         }
@@ -353,11 +396,8 @@ class MetaboLightsRESTTool(BaseTool):
                 extracted_data = data
                 count = len(data)
 
-            # Apply client-side pagination for list/search (API ignores size/page params)
-            if tool_name in (
-                "metabolights_list_studies",
-                "metabolights_search_studies",
-            ):
+            # Apply client-side pagination for the study list (API ignores size/page)
+            if tool_name == "metabolights_list_studies":
                 size = arguments.get("size", 20)
                 page = arguments.get("page", 0)
                 if isinstance(extracted_data, list):

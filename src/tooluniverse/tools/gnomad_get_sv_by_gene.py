@@ -1,7 +1,7 @@
 """
 gnomad_get_sv_by_gene
 
-Get structural variants (SVs) from gnomAD v4 for a gene. Returns deletions, duplications, inversi...
+Get structural variants (SVs) from gnomAD for a gene. The SV callset follows the requested assemb...
 """
 
 from typing import Any, Optional, Callable
@@ -15,9 +15,9 @@ def gnomad_get_sv_by_gene(
     stream_callback: Optional[Callable[[str], None]] = None,
     use_cache: bool = False,
     validate: bool = True,
-) -> dict[str, Any]:
+) -> Any:
     """
-    Get structural variants (SVs) from gnomAD v4 for a gene. Returns deletions, duplications, inversi...
+    Get structural variants (SVs) from gnomAD for a gene. The SV callset follows the requested assemb...
 
     Parameters
     ----------
@@ -34,7 +34,7 @@ def gnomad_get_sv_by_gene(
 
     Returns
     -------
-    dict[str, Any]
+    Any
     """
     # Handle mutable defaults to avoid B006 linting error
 

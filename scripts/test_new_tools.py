@@ -45,13 +45,78 @@ except ImportError:
     )
 
 
+def _missing_distributions(names):
+    """The declared distributions that are not installed, by pip name."""
+    from importlib import metadata
+
+    missing = []
+    for name in names:
+        try:
+            metadata.version(name)
+        except metadata.PackageNotFoundError:
+            missing.append(name)
+    return missing
+
+
+def schema_describes_envelope(schema, _depth=0):
+    """True when *schema* describes the {"status", "data"} envelope itself.
+
+    A schema that declares its own `data` property is describing the envelope,
+    so unwrapping before validation would leave that property absent from the
+    object being checked -- and with nothing `required`, it then passes
+    whatever the tool returned.
+
+    The check looked only at top-level `properties`, which missed every schema
+    declaring `data` inside a oneOf/anyOf/allOf branch -- 138 of them. All six
+    unified_guideline tools reported "Schema Mismatch: At root: [...]" while
+    both the tool and its schema were correct, because the envelope was
+    unwrapped and the bare payload then checked against a schema that only
+    ever described envelopes.
+
+    Recursing alone is not enough, and this is the part that took three
+    attempts. A branch can declare `data` because the *payload* has a field of
+    that name: IDR's API answers {"data": [...], "meta": {...}} and the Art
+    Institute's answers {"config", "data", "info", "pagination"}. Treating
+    those as envelopes stops the unwrap that should happen, and measuring it
+    showed exactly that -- one category fixed, idr and artic broken, the same
+    pair a previous attempt at this broke.
+
+    `status` is what separates them. The envelope is the thing that carries a
+    status, so a branch describes it only when it declares `status` and `data`
+    together. Measured across the 13 affected categories: unified_guideline
+    fixed, idr and artic unchanged.
+    """
+    if not isinstance(schema, dict) or _depth > 4:
+        return False
+    properties = schema.get("properties") or {}
+    if "data" in properties and "status" in properties:
+        return True
+    for keyword in ("oneOf", "anyOf", "allOf"):
+        for branch in schema.get(keyword) or []:
+            if schema_describes_envelope(branch, _depth + 1):
+                return True
+    return False
+
+
 def load_all_tool_configs(
     data_dir: Path, pattern: str = None
 ) -> List[Tuple[Path, List[Dict]]]:
     """Load tool configurations matching the pattern."""
     configs = []
-    search_pattern = f"*{pattern}*" if pattern else "*"
-    files = list(data_dir.glob(f"**/{search_pattern}.json"))
+    # An exact category first. The substring glob below matches filenames, and
+    # "ols" is inside "tools", so `test_new_tools.py ols` matched 647 of the
+    # 688 config files and tested most of the repository. The sweep asks for
+    # one category at a time, so that guaranteed a TIMEOUT for ols on every
+    # weekly run -- measured: still going after 1500 s, at 22 of the
+    # repository's tests. The next-worst name, ensembl, matches 13 files and
+    # all 13 are genuinely ensembl's.
+    exact = data_dir / f"{pattern}_tools.json" if pattern else None
+    if exact is not None and exact.is_file():
+        files = [exact]
+        search_pattern = exact.name
+    else:
+        search_pattern = f"*{pattern}*" if pattern else "*"
+        files = list(data_dir.glob(f"**/{search_pattern}.json"))
 
     # Fallback: If no files found matching pattern, maybe it's a tool name?
     # Try loading ALL files and letting the tool name filter handle it.
@@ -108,38 +173,29 @@ def validate_against_schema(
         return False, str(e)
 
 
-def _schema_describes_envelope(schema: Dict[str, Any]) -> bool:
-    """Heuristic: schema describes the {status,data,error,metadata} envelope.
-
-    Many tool configs declare return_schema at the envelope level (top-level
-    properties include 'data' or 'status'). For those, validating the
-    unwrapped result.get('data') against the schema always fails ("Schema
-    Mismatch: At root: ..."). Detect that style and validate the full result
-    instead. Inner-data schemas (no 'data'/'status' at top) keep the
-    historical unwrapped behaviour.
-
-    Looking for 'error' alone is NOT enough — many inner-data schemas pair an
-    inner array with a {'error': str} error wrapper but still describe the
-    inner data shape, not the envelope.
-    """
-    if not isinstance(schema, dict):
-        return False
-    branches = schema.get("oneOf") or schema.get("anyOf") or [schema]
-    for br in branches:
-        if not isinstance(br, dict):
-            continue
-        props = br.get("properties") or {}
-        if "data" in props or "status" in props:
-            return True
-    return False
-
-
 def format_result(val: Any, max_len: int = 100) -> str:
     """Format result for display."""
     s = str(val)
     if len(s) > max_len:
         return s[:max_len] + "..."
     return s
+
+
+def error_message(result: dict) -> Any:
+    """The failure message of an envelope, wherever the tool put it.
+
+    Many tools put it inside the envelope -- {"status": "error", "data":
+    {"error": ...}}, about 87 return sites. Reading only the top level printed
+    "Failed - None" for every one of them (pypi_package_inspector, run
+    37273817054), which is the one line the weekly report quotes.
+    """
+    error = result.get("error")
+    if error:
+        return error
+    inner = result.get("data")
+    if isinstance(inner, dict):
+        error = inner.get("error") or inner.get("message")
+    return error or result.get("message")
 
 
 def check_for_404_error(result: Any) -> bool:
@@ -201,9 +257,52 @@ def run_tests(
                         f"  ⏭️  {name}: Skipped (requires user-supplied local input file)"
                     )
                 stats["skipped"] += 1
+                stats["skipped_local_input"] = (
+                    stats.get("skipped_local_input", 0) + 1
+                )
+                continue
+
+            # Skip a tool whose own design allows a wait longer than the
+            # sweep's per-category budget. ProteinsPlus submits a job and
+            # polls: poll_interval 15 s and max_wait_time 1800 s, so one call
+            # may legitimately block for half an hour and its six tools can
+            # never fit in 600 s. Reporting that as TIMEOUT reads as a broken
+            # tool, which it is not -- it is a tool the sweep cannot time-box.
+            if tool.get("long_running"):
+                if args.verbose:
+                    print(
+                        f"  ⏭️  {name}: Skipped (long-running: upstream job "
+                        "polling exceeds the sweep budget)"
+                    )
+                stats["skipped"] += 1
+                stats["skipped_long_running"] = (
+                    stats.get("skipped_long_running", 0) + 1
+                )
                 continue
 
             # Check if tool requires API keys that are not available
+            # Skip a tool whose declared packages are not installed.
+            # required_packages has been declared by 119 tools and read by
+            # nothing but `tu info`, so a tool needing pybiolib or py3Dmol was
+            # run anyway and counted as a failure no fix to the tool could
+            # clear. Checked by distribution name, which is what the field
+            # holds -- biopython imports as Bio and pybiolib as biolib, so an
+            # import-name check would need a mapping that drifts.
+            missing_packages = _missing_distributions(
+                tool.get("required_packages") or []
+            )
+            if missing_packages:
+                if args.verbose:
+                    print(
+                        f"  ⏭️  {name}: Skipped (needs "
+                        f"{', '.join(missing_packages)} installed)"
+                    )
+                stats["skipped"] += 1
+                stats["skipped_missing_package"] = (
+                    stats.get("skipped_missing_package", 0) + 1
+                )
+                continue
+
             required_keys = tool.get("required_api_keys", [])
             if required_keys:
                 missing_keys = [key for key in required_keys if not os.getenv(key)]
@@ -297,8 +396,27 @@ def run_tests(
                         # Check for status field (new API style)
                         if "status" in result:
                             success = result["status"] == "success"
-                            data = result.get("data")
-                            error = result.get("error")
+                            # Only unwrap when a `data` key is actually there.
+                            # Plenty of tools use `status` as a field of their
+                            # own payload and never emit `data`: FAERS returns
+                            # {"status", "reports", "total_available", ...} and
+                            # its return_schema lists `status` among its own
+                            # properties. Unwrapping those gave None, and every
+                            # healthy call was reported as
+                            # "Schema Mismatch: None is not of type 'object'".
+                            #
+                            # And do not unwrap when the schema itself declares
+                            # `data`: it is describing the envelope, so checking
+                            # the inner payload leaves the declared property
+                            # absent and -- nothing being `required` -- passes
+                            # whatever the tool returned. Matches cli.py.
+                            declares_data = schema_describes_envelope(schema)
+                            data = (
+                                result["data"]
+                                if "data" in result and not declares_data
+                                else result
+                            )
+                            error = error_message(result)
                         # Check for success field (old style)
                         elif "success" in result:
                             success = result["success"]
@@ -317,15 +435,20 @@ def run_tests(
 
                     if success:
                         stats["passed"] += 1
-                        # Validate Schema: envelope-style schemas describe the
-                        # whole {status,data,...} return; inner-data schemas
-                        # describe only the data payload. Pick the right target.
-                        validation_target = (
-                            result if _schema_describes_envelope(schema) else data
-                        )
-                        is_valid, schema_err = validate_against_schema(
-                            validation_target, schema
-                        )
+                        # return_schema describes the unwrapped data payload,
+                        # never the {status,data,...} envelope — matches
+                        # cli.py's `tu test` exactly (see devtu-fix-tool/
+                        # SKILL.md: "Schema validates the data field content,
+                        # NOT the full response"). A prior envelope-detection
+                        # heuristic here tried to auto-pick the validation
+                        # target, but any tool whose own payload legitimately
+                        # has a field named "status" or "data" (e.g. ENCODE's
+                        # own "status": "released", or IDR's own nested
+                        # "data" key) fooled it into validating the wrong
+                        # target. The real fix is upstream: correct schemas
+                        # to describe `data` directly, not paper over
+                        # incorrect ones here.
+                        is_valid, schema_err = validate_against_schema(data, schema)
                         if is_valid:
                             stats["schema_valid"] += 1
                             if args.verbose:
@@ -428,6 +551,14 @@ def main():
     if stats["errors_other"] > 0:
         print(f"  └─ Other Errors: {stats['errors_other']}")
     print(f"Skipped:          {stats['skipped']}")
+    # Three different reasons share the skipped count, and the sweep used to
+    # label every one of them "need a credential".
+    if stats.get("skipped_local_input"):
+        print(f"Skipped local input: {stats['skipped_local_input']}")
+    if stats.get("skipped_long_running"):
+        print(f"Skipped long running: {stats['skipped_long_running']}")
+    if stats.get("skipped_missing_package"):
+        print(f"Skipped missing package: {stats['skipped_missing_package']}")
     print("-" * 30)
     print(f"Schema Valid:     {stats['schema_valid']}")
     print(f"Schema Invalid:   {stats['schema_invalid']}")

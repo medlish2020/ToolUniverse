@@ -58,7 +58,7 @@ results = tu.run({"name": "EuropePMC_search_articles", "arguments": {
 }})
 
 # Process results
-for article in results:
+for article in results["data"]:
    print(f"Title: {article['title']}")
    print(f"Open Access: {article['open_access']}")
 
@@ -222,7 +222,7 @@ for paper in oa_pdfs[:3]:
 Always verify `open_access: true` before attempting full-text extraction:
 
 ```python
-for article in results:
+for article in results["data"]:
    if article.get("open_access"):
        # Proceed with full-text extraction
        pass
@@ -243,7 +243,7 @@ results = tu.run({"name": "EuropePMC_search_articles", "arguments": {
 }})
 
 # Quickly scan which articles contain your terms
-relevant = [r for r in results if r.get("fulltext_snippets")]
+relevant = [r for r in results["data"] if r.get("fulltext_snippets")]
 print(f"Found {len(relevant)} articles with matching terms in full text")
 ```
 
@@ -270,7 +270,7 @@ Semantic Scholar and ArXiv have rate limits:
 import time
 
 for paper in papers:
-   snippets = tu.run({"name": "ArXiv_get_pdf_snippets", "arguments": {"arxiv_id": paper["arxiv_id"], terms=terms}})
+   snippets = tu.run({"name": "ArXiv_get_pdf_snippets", "arguments": {"arxiv_id": paper["arxiv_id"], "terms": terms}})
    # ArXiv requests 3s between calls
    time.sleep(3.1)
 ```
@@ -305,8 +305,21 @@ def extract_or_skip(article, terms):
 **Solution:** Install markitdown with all dependencies:
 
 ```bash
-pip install 'markitdown[all]>=0.1.0'
+pip install 'markitdown[audio-transcription,az-doc-intel,docx,outlook,pdf,pptx,xls,xlsx,youtube-transcription]>=0.1.0'
 ```
+
+### Optional PyMuPDF backend
+
+The default installation can extract PDF text without PyMuPDF. To opt into the
+faster `extractor="fitz"` backend, install:
+
+```bash
+pip install 'tooluniverse[pdf]'
+```
+
+PyMuPDF is licensed under AGPL-3.0 or a commercial Artifex license and is
+therefore not installed by default or by `tooluniverse[all]`. Review those
+terms before enabling it in a distributed or commercial deployment.
 
 ### Issue: Europe PMC auto-snippets returns empty
 
@@ -318,9 +331,9 @@ pip install 'markitdown[all]>=0.1.0'
 **Debug:**
 
 ```python
-results = tu.run({"name": "EuropePMC_search_articles", "arguments": {"query": "...", limit=10}})
+results = tu.run({"name": "EuropePMC_search_articles", "arguments": {"query": "...", "limit": 10}})
 
-for r in results:
+for r in results["data"]:
    print(f"Title: {r['title']}")
    print(f"  OA: {r['open_access']}")
    print(f"  XML URL: {r.get('fulltext_xml_url', 'N/A')}")
@@ -339,7 +352,7 @@ for r in results:
 ```python
 # For Semantic Scholar: verify OA status
 if paper.get("open_access") and paper.get("open_access_pdf_url"):
-   # Proceed
+   pass  # Process paper["open_access_pdf_url"] with your PDF pipeline.
 
 # For ArXiv: ensure correct ID format
 arxiv_id = "2301.12345"  # Not "arXiv:2301.12345v1"
@@ -407,7 +420,7 @@ def rate_limited_extract(papers, delay=3):
 | Service | Rate Limit (no key) | Rate Limit (with key) | Key Required? |
 |---------|--------------------|-----------------------|---------------|
 | Europe PMC | Unspecified | Unspecified | No |
-| Semantic Scholar | 1 req/sec | 100 req/sec | Optional (`SEMANTIC_SCHOLAR_API_KEY`) |
+| Semantic Scholar | Shared adaptive pool | 1 req/sec introductory per-key quota | Optional (`SEMANTIC_SCHOLAR_API_KEY`) |
 | ArXiv | 3s between requests | N/A | No |
 | PubMed | 3 req/sec | 10 req/sec | Optional (`NCBI_API_KEY`) |
 
@@ -427,7 +440,7 @@ results = tu.run({"name": "EuropePMC_search_articles", "arguments": {
 
 # Step 2: Build context for LLM
 context = []
-for r in results:
+for r in results["data"]:
    if "fulltext_snippets" in r:
        context.append({
            "title": r["title"],

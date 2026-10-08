@@ -5,7 +5,6 @@ Run this script BEFORE building the MCP bundle (e.g., with PyInstaller or Nuitka
 It scans the source code for tools and writes a static mapping to _lazy_registry_static.py.
 """
 
-import os
 import sys
 import json
 from pathlib import Path
@@ -23,7 +22,13 @@ except ImportError:
     sys.exit(1)
 
 
-def main():
+def main(output_path: Path | None = None):
+    """Write the static lazy registry.
+
+    ``output_path`` defaults to ``_lazy_registry_static.py`` inside the
+    installed package; pass an explicit path to generate elsewhere (tests use
+    this so they never write into the source tree).
+    """
     print("🔍 Scanning for tools using AST discovery...")
 
     # Build the registry using the existing AST logic
@@ -36,7 +41,14 @@ def main():
         print(f"✅ Discovered {len(registry)} tool classes.")
 
     # Generate the static file content
-    output_path = Path(__file__).parent / "_lazy_registry_static.py"
+    if output_path is None:
+        output_path = Path(__file__).parent / "_lazy_registry_static.py"
+
+    # The output is Python source. Include its final dictionary comma so
+    # formatting cannot invalidate the generated-file consistency check.
+    registry_literal = json.dumps(registry, indent=4, sort_keys=True)
+    if registry:
+        registry_literal = registry_literal[:-2] + ",\n}"
 
     content = f'''"""
 STATIC LAZY REGISTRY - GENERATED FILE
@@ -45,7 +57,7 @@ This file allows lazy loading to work in frozen environments where source files 
 """
 
 # Map of tool_name -> module_name
-STATIC_LAZY_REGISTRY = {json.dumps(registry, indent=4, sort_keys=True)}
+STATIC_LAZY_REGISTRY = {registry_literal}
 '''
 
     print(f"💾 Writing static registry to {output_path}...")
