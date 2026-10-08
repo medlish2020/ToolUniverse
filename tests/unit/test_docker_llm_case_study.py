@@ -11,7 +11,9 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-MODULE_PATH = Path(__file__).parents[2] / "examples" / "docker_llm" / "run_smoke_case.py"
+MODULE_PATH = (
+    Path(__file__).parents[2] / "examples" / "docker_llm" / "run_smoke_case.py"
+)
 SPEC = importlib.util.spec_from_file_location("docker_llm_smoke_case", MODULE_PATH)
 assert SPEC and SPEC.loader
 study = importlib.util.module_from_spec(SPEC)
