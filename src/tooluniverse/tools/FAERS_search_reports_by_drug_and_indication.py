@@ -20,7 +20,7 @@ def FAERS_search_reports_by_drug_and_indication(
     stream_callback: Optional[Callable[[str], None]] = None,
     use_cache: bool = False,
     validate: bool = True,
-) -> list[Any]:
+) -> dict[str, Any]:
     """
     Search and retrieve detailed adverse event reports for a specific drug and indication. Returns in...
 
@@ -29,7 +29,7 @@ def FAERS_search_reports_by_drug_and_indication(
     medicinalproduct : str
         Drug name (required).
     drugindication : str
-        Optional: Filter by drug indication (e.g., 'Dementia Alzheimer\\'s type', 'Al...
+        Optional: Filter by drug indication (e.g., 'Dementia Alzheimer\\'s type', 'Alz...
     limit : int
         Maximum number of reports to return. Must be between 1 and 100.
     skip : int
@@ -49,7 +49,7 @@ def FAERS_search_reports_by_drug_and_indication(
 
     Returns
     -------
-    list[Any]
+    dict[str, Any]
     """
     # Handle mutable defaults to avoid B006 linting error
 

@@ -15,6 +15,21 @@ from typing import no_type_check, Optional, Dict, Any
 import hashlib
 import inspect
 
+from .credentials import get_credential
+
+
+def request_url(sent: Any, endpoint: str) -> str:
+    """The URI actually sent, falling back to ``endpoint``.
+
+    A tool that puts its query in ``params=`` and then echoes the endpoint
+    constant publishes a URL identical for every call, which no caller can
+    replay -- so echo what the HTTP layer resolved instead. ``sent`` is a
+    Response or a PreparedRequest; both carry ``.url``. Stubbed responses in
+    tests carry a non-string there, which must never reach the payload.
+    """
+    resolved = getattr(sent, "url", None)
+    return resolved if isinstance(resolved, str) and resolved else endpoint
+
 
 def resolve_configured_operation(tool_config: Any) -> Optional[str]:
     """Return the ``operation`` a tool's own config implies, if any.
@@ -38,12 +53,51 @@ def resolve_configured_operation(tool_config: Any) -> Optional[str]:
     return operation if isinstance(operation, str) and operation else None
 
 
+def null_result_error(tool_name: Any) -> Dict[str, Any]:
+    """The response for a tool that returned ``None``.
+
+    Fix-47-4: there is no tool for which ``None`` is a valid answer, but the
+    dispatch wrappers used to fall back on a generic ``{"result": <value>}``
+    envelope, so a ``None`` became ``{"result": None}`` -- a dict carrying
+    neither ``status`` nor ``error``, which the CLI prints as
+    ``{"result": null}`` and exits 0 on. Every one of those was a failed call
+    presented as a successful empty answer: for the openFDA label family
+    (157 tools) ``{"result": null}`` in reply to a boxed-warning question
+    reads as "this drug has no boxed warning".
+
+    The openFDA path that produced most of them is fixed at source in
+    ``openfda_tool.search_openfda``, but a ``None`` from ANY tool reaches the
+    caller through these wrappers, so the invariant is stated once here and
+    applied by each of them rather than re-worded per call site.
+    """
+    return {
+        "status": "error",
+        "error": (
+            f"Tool '{tool_name}' returned no result. This is a failure of the "
+            "call, not an answer: it does not mean the query matched nothing, "
+            "and no conclusion may be drawn from it. Retry, and if it "
+            "persists report the tool name and arguments."
+        ),
+    }
+
+
 class BaseTool:
     STATIC_CACHE_VERSION = "1"
 
     def __init__(self, tool_config):
         self.tool_config = self._apply_defaults(tool_config)
         self._cached_version_hash: Optional[str] = None
+
+    def credential(self, name: str, fallback: Optional[str] = None) -> Optional[str]:
+        """Resolve a request-scoped credential with an environment fallback.
+
+        Concrete tools should use this helper instead of reading a credential once during
+        construction. Outside a request context, ``fallback`` takes precedence when supplied;
+        otherwise the environment variable named by ``name`` is read. The fallback is ignored
+        whenever a request credential context is active, including an explicitly empty context.
+        """
+
+        return get_credential(name, fallback)
 
     @classmethod
     def get_default_config_file(cls):
@@ -283,6 +337,24 @@ class BaseTool:
         )
         return norm_to_prop[match[0]] if match else None
 
+    @staticmethod
+    def _format_instance_path(path) -> str:
+        """Render a jsonschema instance path as the caller wrote it.
+
+        ``['responses', 4]`` becomes ``responses[4]`` and
+        ``['options', 'mode']`` becomes ``options.mode``. An empty path is
+        ``root``.
+        """
+        rendered = ""
+        for part in path:
+            if isinstance(part, int):
+                rendered += f"[{part}]"
+            elif rendered:
+                rendered += f".{part}"
+            else:
+                rendered = str(part)
+        return rendered or "root"
+
     def validate_parameters(self, arguments: Dict[str, Any]) -> Optional[ToolError]:
         """
         Validate parameters against tool schema.
@@ -421,8 +493,16 @@ class BaseTool:
                         )
             return None
         except jsonschema.ValidationError as e:
-            # Create a more agent-friendly error message
-            error_msg = f"Parameter validation failed for '{e.path[-1] if e.path else 'root'}': {e.message}"
+            # Name the failure by its whole path. The last path element alone
+            # is an array index for a bad list element ('4' for responses[4])
+            # and drops the parent for a nested key. absolute_path, not path:
+            # under anyOf/oneOf, jsonschema reports a sub-error whose `path`
+            # is relative to the parameter, so it starts at the index.
+            instance_path = list(e.absolute_path)
+            error_msg = (
+                f"Parameter validation failed for "
+                f"'{self._format_instance_path(instance_path)}': {e.message}"
+            )
 
             # Add type hint if it's a type error
             if e.validator == "type":
@@ -521,7 +601,9 @@ class BaseTool:
                     "validation_error": str(e),
                     "path": list(e.absolute_path) if e.absolute_path else [],
                     "schema": schema,
-                    "parameter": str(e.path[-1]) if e.path else "root",
+                    # The top level argument the caller passed; the full
+                    # path stays in "path" above.
+                    "parameter": str(instance_path[0]) if instance_path else "root",
                     "expected": str(e.validator_value)
                     if hasattr(e, "validator_value")
                     else None,

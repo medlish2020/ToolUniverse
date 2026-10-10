@@ -126,6 +126,21 @@ def _union_nodes_by_id(preferred: list, extra: list) -> list:
     return merged
 
 
+def _gene_lookup_error(gene_name: str, failures: list) -> Dict[str, Any]:
+    if failures:
+        return {
+            "status": "error",
+            "error": (
+                f"Could not look up gene '{gene_name}': CIViC did not answer "
+                f"({failures[0]}). This is not a 'not found'; retry later."
+            ),
+        }
+    return {
+        "status": "error",
+        "error": f"Gene '{gene_name}' not found in CIViC database",
+    }
+
+
 @register_tool("CIViCTool")
 class CIViCTool(BaseTool):
     """
@@ -202,8 +217,15 @@ class CIViCTool(BaseTool):
 
         return payload
 
-    def _lookup_gene_id(self, gene_name: str) -> Optional[int]:
-        """Look up CIViC gene ID by gene symbol via GraphQL."""
+    def _lookup_gene_id(
+        self, gene_name: str, failures: Optional[list] = None
+    ) -> Optional[int]:
+        """Look up CIViC gene ID by gene symbol via GraphQL.
+
+        None means "not found" only when `failures` is still empty: a request
+        that failed appends its reason there. The two used to be the same None,
+        so a timeout was reported as "Gene 'X' not found in CIViC database".
+        """
         payload = {
             "query": "query GetGenes($entrezSymbols: [String!]) { genes(entrezSymbols: $entrezSymbols) { nodes { id name } } }",
             "variables": {"entrezSymbols": [gene_name.upper()]},
@@ -218,12 +240,15 @@ class CIViCTool(BaseTool):
                     "Accept": "application/json",
                 },
             )
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}")
             data = resp.json().get("data", {})
             nodes = data.get("genes", {}).get("nodes", [])
             if nodes:
                 return nodes[0]["id"]
-        except Exception:
-            pass
+        except Exception as e:
+            if failures is not None:
+                failures.append(str(e) or type(e).__name__)
         return None
 
     def _get_variants_for_gene_id(
@@ -239,6 +264,7 @@ class CIViCTool(BaseTool):
         PAGINATED_QUERY = (
             "query GetVariantsByGene($gene_id: Int!, $page_size: Int, $after: String) { "
             "gene(id: $gene_id) { id name variants(first: $page_size, after: $after) { "
+            "totalCount "
             "nodes { id name ... on GeneVariant { feature { id name } } } "
             "pageInfo { hasNextPage endCursor } } } }"
         )
@@ -246,8 +272,22 @@ class CIViCTool(BaseTool):
         all_nodes: list = []
         cursor = None
         gene_meta: Dict[str, Any] = {}
+        total_count: Optional[int] = None
+        # Page budget. The loop's only exits were "hasNextPage is false" and "no
+        # endCursor", both of which are the server's to give: a page carrying
+        # zero nodes with hasNextPage true never grows all_nodes, and a server
+        # repeating the same endCursor never advances, so either one spins this
+        # request forever inside a tool the harness itself calls. The budget is
+        # derived from the caller's own limit rather than fixed, so it cannot
+        # truncate a request that is making progress -- ceil(limit/PAGE_SIZE)
+        # full pages suffice by construction, and the spare page absorbs a
+        # short page from server-side filtering. Reaching it means the pages
+        # stopped advancing.
+        max_pages = -(-limit // PAGE_SIZE) + 1
         try:
-            while len(all_nodes) < limit:
+            for _ in range(max_pages):
+                if len(all_nodes) >= limit:
+                    break
                 fetch = min(PAGE_SIZE, limit - len(all_nodes))
                 variables: Dict[str, Any] = {
                     "gene_id": gene_id,
@@ -276,14 +316,17 @@ class CIViCTool(BaseTool):
                         "name": gene_data.get("name"),
                     }
                 variants_block = gene_data.get("variants", {})
+                if total_count is None:
+                    total_count = variants_block.get("totalCount")
                 nodes = variants_block.get("nodes", [])
                 all_nodes.extend(nodes)
                 page_info = variants_block.get("pageInfo", {})
-                if not page_info.get("hasNextPage"):
+                if not page_info.get("hasNextPage") or not nodes:
                     break
-                cursor = page_info.get("endCursor")
-                if not cursor:
+                next_cursor = page_info.get("endCursor")
+                if not next_cursor or next_cursor == cursor:
                     break
+                cursor = next_cursor
             # Feature-46B-01: deduplicate by variant ID (prevents pagination overlap artifacts)
             seen_ids: set = set()
             deduped: list = []
@@ -301,11 +344,21 @@ class CIViCTool(BaseTool):
             all_nodes = deduped
             # Flag variant names that appear multiple times (distinct CIViC records)
             duplicate_names = [n for n, c in name_count.items() if c > 1]
-            # Reassemble in the original single-request structure
+            # Reassemble in the original single-request structure.
+            # totalCount is how many variants the gene has in CIViC; len(nodes)
+            # is only how many `limit` allowed through. Dropping it left callers
+            # reporting the page size as if it were the gene's variant count.
+            returned = all_nodes[:limit]
+            variants_out: Dict[str, Any] = {"nodes": returned}
+            if total_count is not None:
+                variants_out.update(
+                    totalCount=total_count,
+                    pageInfo={"hasNextPage": len(returned) < total_count},
+                )
             data = {
                 "gene": {
                     **gene_meta,
-                    "variants": {"nodes": all_nodes[:limit]},
+                    "variants": variants_out,
                 }
             }
             metadata: Dict[str, Any] = {"source": "CIViC", "format": "GraphQL"}
@@ -342,12 +395,10 @@ class CIViCTool(BaseTool):
                         "status": "error",
                         "error": "gene_id or gene_name is required for civic_get_variants_by_gene",
                     }
-                gene_id = self._lookup_gene_id(gene_name)
+                failures: list = []
+                gene_id = self._lookup_gene_id(gene_name, failures)
                 if gene_id is None:
-                    return {
-                        "status": "error",
-                        "error": f"Gene '{gene_name}' not found in CIViC database",
-                    }
+                    return _gene_lookup_error(gene_name, failures)
                 arguments = dict(arguments)
                 arguments["gene_id"] = gene_id
             return self._get_variants_for_gene_id(
@@ -502,12 +553,10 @@ class CIViCTool(BaseTool):
                 arguments = dict(arguments)
                 arguments["query"] = query_term
             if gene_name:
-                gene_id = self._lookup_gene_id(gene_name)
+                failures: list = []
+                gene_id = self._lookup_gene_id(gene_name, failures)
                 if gene_id is None:
-                    return {
-                        "status": "error",
-                        "error": f"Gene '{gene_name}' not found in CIViC database",
-                    }
+                    return _gene_lookup_error(gene_name, failures)
                 # Feature-43B-01: when gene+query combined, always fetch up to 200 variants
                 # before client-side filtering; the user's limit applies to the OUTPUT,
                 # not the pre-filter fetch — otherwise alphabetically early variants may

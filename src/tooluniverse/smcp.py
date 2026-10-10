@@ -92,18 +92,48 @@ AI Agent Interface:
 """
 
 import asyncio
+import copy
 import functools
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union, Callable, Literal
 
 from fastmcp import FastMCP
 
 FASTMCP_AVAILABLE = True
 
+# FastMCP's banner checks PyPI and says "Update available: 4.x -- Run: pip install --upgrade
+# fastmcp". ToolUniverse requires fastmcp<4, so following that advice breaks the install it was
+# printed by -- shown to everyone who ran `tu serve my_tool.py --share`. Someone who wants the
+# check can still ask for it with FASTMCP_CHECK_FOR_UPDATES.
+if not os.environ.get("FASTMCP_CHECK_FOR_UPDATES"):
+    import fastmcp as _fastmcp
+
+    _fastmcp.settings.check_for_updates = "off"
+
+
+def _json_default(value: Any) -> Any:
+    """Turn the values scientific code returns into JSON, not their str().
+
+    json.dumps(default=_json_default) turned a numpy array into the text "[0. 3. 6. 9.]" -- measured with
+    a @remote_tool returning an embedding -- so the caller received a string where it expected
+    numbers. numpy arrays and scalars, and pandas frames and series, all have exact JSON forms.
+    Anything else keeps the old fallback.
+    """
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict) and hasattr(value, "columns"):
+        return to_dict(orient="records")
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=str)
+    return str(value)
+
 from .execute_function import ToolUniverse
+from .agentic_tool import render_agentic_instruction
+from .credentials import ContextThreadPoolExecutor
 from .logging_config import (
     get_logger,
 )
@@ -123,17 +153,26 @@ def _save_full_response(serialized: str) -> str:
     return path
 
 
-def _truncate_response(result: Any, serialized: str, max_chars: int) -> str:
+def _truncate_response(
+    result: Any,
+    serialized: str,
+    max_chars: int,
+    *,
+    persist_full_result: bool = True,
+) -> str:
     """Truncate oversized tool responses to fit LLM context windows.
 
-    Saves the full response to a temp file, then tries to intelligently
-    truncate lists within the result before falling back to raw string
-    truncation. The temp file path is included in the truncated response.
+    When ``persist_full_result`` is enabled, saves the full response to a temp
+    file and includes that path. Remote providers disable persistence because
+    a server-local path is unusable to callers and can retain sensitive data.
+    Lists are truncated intelligently before falling back to raw text.
     """
-    try:
-        full_path = _save_full_response(serialized)
-    except Exception:
-        full_path = None
+    full_path = None
+    if persist_full_result:
+        try:
+            full_path = _save_full_response(serialized)
+        except Exception:
+            full_path = None
 
     truncation_meta = (
         {
@@ -150,7 +189,7 @@ def _truncate_response(result: Any, serialized: str, max_chars: int) -> str:
         lo, hi = 1, total
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            trial = json.dumps(result[:mid], ensure_ascii=False, default=str)
+            trial = json.dumps(result[:mid], ensure_ascii=False, default=_json_default)
             if len(trial) <= max_chars - 500:  # leave room for metadata
                 lo = mid
             else:
@@ -165,7 +204,7 @@ def _truncate_response(result: Any, serialized: str, max_chars: int) -> str:
                 **truncation_meta,
             },
             ensure_ascii=False,
-            default=str,
+            default=_json_default,
         )
 
     # If result is a dict, try to truncate the largest list value
@@ -187,7 +226,7 @@ def _truncate_response(result: Any, serialized: str, max_chars: int) -> str:
                     f"_{largest_key}_total": total,
                     **truncation_meta,
                 }
-                trial = json.dumps(trimmed, ensure_ascii=False, default=str)
+                trial = json.dumps(trimmed, ensure_ascii=False, default=_json_default)
                 if len(trial) <= max_chars:
                     return trial
                 keep = keep // 2
@@ -197,6 +236,17 @@ def _truncate_response(result: Any, serialized: str, max_chars: int) -> str:
     if full_path:
         suffix += f"\nFull response saved to: {full_path}"
     return serialized[:max_chars] + suffix
+
+
+def _readable_tool_title(name: str) -> str:
+    """Human-readable title for a tool that declares none.
+
+    The directory requires ``title`` on every tool. Registered names read
+    ``Vendor_verb_what``, so replacing the separators is enough to give a
+    reviewer and a user something legible without inventing wording that could
+    drift from the description.
+    """
+    return name.replace("_", " ").strip() or name
 
 
 class SMCP(FastMCP):
@@ -325,6 +375,12 @@ class SMCP(FastMCP):
         When True, all loaded tools become available via the MCP interface
         with automatic schema conversion and execution wrapping.
 
+    expose_agentic_prompts : bool, default False
+        Whether to expose loaded AgenticTool prompt templates as MCP prompts for
+        execution by the connected host model. This path only renders instructions;
+        it does not initialize or call a ToolUniverse backend LLM client. The legacy
+        AgenticTool execution path remains available when credentials are configured.
+
     search_enabled : bool, default True
         Enable AI-powered tool search functionality via tools/find method.
         Includes ToolFinderLLM (cost-optimized LLM-based), Tool_RAG (embedding-based),
@@ -398,12 +454,15 @@ class SMCP(FastMCP):
         workspace: Optional[str] = None,
         use_global: bool = False,
         auto_expose_tools: bool = True,
+        expose_agentic_prompts: bool = False,
         search_enabled: bool = True,
         max_workers: int = 5,
         hooks_enabled: bool = False,
         hook_config: Optional[Dict[str, Any]] = None,
         hook_type: Optional[str] = None,
         compact_mode: bool = False,
+        persist_oversized_results: bool = True,
+        strict_input_schemas: bool = False,
         **kwargs,
     ):
         if not FASTMCP_AVAILABLE:
@@ -469,8 +528,15 @@ class SMCP(FastMCP):
         self.exclude_tool_types = exclude_tool_types or []
         self.profile = profile
         self.compact_mode = compact_mode
+        if not isinstance(persist_oversized_results, bool):
+            raise TypeError("persist_oversized_results must be a boolean")
+        self.persist_oversized_results = persist_oversized_results
+        if not isinstance(strict_input_schemas, bool):
+            raise TypeError("strict_input_schemas must be a boolean")
+        self.strict_input_schemas = strict_input_schemas
         # In compact mode, don't auto-expose all tools
         self.auto_expose_tools = False if compact_mode else auto_expose_tools
+        self.expose_agentic_prompts = expose_agentic_prompts
         self.search_enabled = search_enabled
         self.max_workers = max_workers
         self.hooks_enabled = hooks_enabled
@@ -482,10 +548,14 @@ class SMCP(FastMCP):
         self.profile_metadata = None
 
         # Thread pool for concurrent tool execution
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        # Preserve request-scoped credentials and tracing context across the async-to-sync
+        # boundary. Standard ThreadPoolExecutor drops ContextVars and can therefore make a hosted
+        # request silently fall back to process-global credentials.
+        self.executor = ContextThreadPoolExecutor(max_workers=max_workers)
 
         # Track exposed tools to avoid duplicates
         self._exposed_tools = set()
+        self._exposed_agentic_prompts = set()
 
         # Initialize TaskManager for MCP Tasks support
         from .task_manager import TaskManager
@@ -935,7 +1005,7 @@ class SMCP(FastMCP):
                         {"tools": [], "result": result}, ensure_ascii=False
                     )
             elif isinstance(result, dict) or isinstance(result, list):
-                serialized = json.dumps(result, ensure_ascii=False, default=str)
+                serialized = json.dumps(result, ensure_ascii=False, default=_json_default)
             else:
                 serialized = json.dumps(
                     {"tools": [], "result": str(result)}, ensure_ascii=False
@@ -944,7 +1014,12 @@ class SMCP(FastMCP):
             # Guard against oversized responses
             max_chars = 100_000
             if len(serialized) > max_chars:
-                serialized = _truncate_response(result, serialized, max_chars)
+                serialized = _truncate_response(
+                    result,
+                    serialized,
+                    max_chars,
+                    persist_full_result=self.persist_oversized_results,
+                )
             return serialized
 
         except Exception as e:
@@ -970,7 +1045,7 @@ class SMCP(FastMCP):
             str: Tool name to use for search
         """
         # Get available tools
-        all_tools = self.tooluniverse.return_all_loaded_tools()
+        all_tools = self.tooluniverse.return_all_loaded_tools(copy_tools=False)
         available_tool_names = [tool.get("name", "") for tool in all_tools]
 
         # Handle specific method requests
@@ -1024,7 +1099,15 @@ class SMCP(FastMCP):
             self._ensure_compact_mode_categories()
         elif preloaded_count == 0 and self.tool_categories:
             self._load_by_categories()
-        elif (self.auto_expose_tools or self.compact_mode) and not profile_loaded:
+        elif (
+            preloaded_count == 0
+            and (
+                self.auto_expose_tools
+                or self.compact_mode
+                or self.expose_agentic_prompts
+            )
+            and not profile_loaded
+        ):
             # Load all tools by default (unless Profile already handled it)
             self._load_tools_with_filters()
             self._ensure_compact_mode_categories()
@@ -1037,6 +1120,12 @@ class SMCP(FastMCP):
         # In compact mode, _expose_tooluniverse_tools will call _expose_core_discovery_tools
         if self.auto_expose_tools or self.compact_mode:
             self._expose_tooluniverse_tools()
+
+        # AgenticTool configs can also be exposed as host-executed MCP prompts.
+        # This path is independent of backend LLM credentials and intentionally
+        # opt-in so existing servers retain their current surface area.
+        if self.expose_agentic_prompts:
+            self._expose_agentic_tool_prompts()
 
         # Add search functionality if enabled
         if self.search_enabled:
@@ -1106,6 +1195,157 @@ class SMCP(FastMCP):
         exposed_count = len(self._exposed_tools)
         self.logger.info(f"Successfully exposed {exposed_count} tools to MCP interface")
 
+    def _iter_agentic_prompt_configs(self):
+        """Yield filtered AgenticTool configs, including configs hidden for no API key.
+
+        ``ToolUniverse.load_tools`` retains the raw per-category configurations in
+        ``tool_category_dicts`` before availability filtering removes AgenticTools
+        from ``all_tools``. Reading both collections lets SMCP expose instructions
+        even when the backend-executed tool cannot initialize an LLM client.
+        """
+        candidates = []
+        category_dicts = getattr(self.tooluniverse, "tool_category_dicts", {}) or {}
+        for configs in category_dicts.values():
+            if isinstance(configs, list):
+                candidates.extend(configs)
+        candidates.extend(getattr(self.tooluniverse, "all_tools", []) or [])
+
+        include_names = set(self.include_tools or [])
+        if self.tools_file:
+            try:
+                include_names.update(
+                    self.tooluniverse._load_tool_names_from_file(self.tools_file)
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not apply tools-file filtering to AgenticTool prompts: {e}"
+                )
+
+        exclude_names = set(self.exclude_tools or [])
+        include_types = set(self.include_tool_types or [])
+        exclude_types = set(self.exclude_tool_types or [])
+        seen = set()
+
+        for tool_config in candidates:
+            if not isinstance(tool_config, dict):
+                continue
+            tool_name = tool_config.get("name")
+            tool_type = tool_config.get("type")
+            if not tool_name or tool_name in seen or tool_type != "AgenticTool":
+                continue
+            if tool_name in exclude_names:
+                continue
+            if include_names and tool_name not in include_names:
+                continue
+            if include_types and tool_type not in include_types:
+                continue
+            if tool_type in exclude_types:
+                continue
+            if not tool_config.get("prompt") or not tool_config.get("input_arguments"):
+                self.logger.warning(
+                    f"Skipping invalid AgenticTool prompt config: {tool_name}"
+                )
+                continue
+
+            seen.add(tool_name)
+            yield tool_config
+
+    def _expose_agentic_tool_prompts(self):
+        """Register loaded AgenticTool prompt templates as MCP prompts."""
+        exposed_count = 0
+        for tool_config in self._iter_agentic_prompt_configs():
+            tool_name = tool_config["name"]
+            if tool_name in self._exposed_agentic_prompts:
+                continue
+            try:
+                self._create_mcp_prompt_from_agentic_tool(tool_config)
+                self._exposed_agentic_prompts.add(tool_name)
+                exposed_count += 1
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to expose AgenticTool prompt {tool_name}: {e}"
+                )
+
+        self.logger.info(
+            f"Successfully exposed {exposed_count} AgenticTool prompts to MCP interface"
+        )
+
+    def _create_mcp_prompt_from_agentic_tool(self, tool_config: Dict[str, Any]):
+        """Create a typed, host-executed MCP prompt from an AgenticTool config."""
+        import inspect
+        from typing import Annotated
+
+        from pydantic import Field
+
+        tool_name = tool_config["name"]
+        tool_description = tool_config.get("description", "")
+        prompt_description = (
+            "Host-executed instruction derived from the ToolUniverse AgenticTool "
+            f"'{tool_name}'. {tool_description}"
+        ).strip()
+        parameters = tool_config.get("parameter", {}) or {}
+        properties = parameters.get("properties", {}) or {}
+        input_arguments = tool_config.get("input_arguments", []) or []
+        required_params = parameters.get("required", []) or []
+
+        func_params = []
+        param_annotations = {}
+        for is_required_phase in (True, False):
+            for param_name in input_arguments:
+                param_info = properties.get(param_name, {}) or {}
+                is_required = param_name in required_params
+                if is_required != is_required_phase:
+                    continue
+
+                python_type, extra_kwargs = self._resolve_param_type(param_info)
+                field = Field(
+                    description=param_info.get(
+                        "description", f"{param_name} parameter"
+                    ),
+                    **extra_kwargs,
+                )
+                if is_required:
+                    annotated_type = Annotated[python_type, field]
+                    default = inspect.Parameter.empty
+                else:
+                    annotated_type = Annotated[Union[python_type, type(None)], field]
+                    default = None
+
+                param_annotations[param_name] = annotated_type
+                func_params.append(
+                    inspect.Parameter(
+                        param_name,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        default=default,
+                        annotation=annotated_type,
+                    )
+                )
+
+        def dynamic_prompt_function(**kwargs) -> str:
+            prompt_arguments = {
+                key: value for key, value in kwargs.items() if value is not None
+            }
+            return render_agentic_instruction(tool_config, prompt_arguments)
+
+        dynamic_prompt_function.__name__ = tool_name
+        dynamic_prompt_function.__signature__ = inspect.Signature(func_params)
+        annotations = param_annotations.copy()
+        annotations["return"] = str
+        dynamic_prompt_function.__annotations__ = annotations
+        dynamic_prompt_function.__doc__ = prompt_description
+
+        self.prompt(
+            name=tool_name,
+            description=prompt_description,
+            tags={"tooluniverse", "agentic-instruction"},
+            meta={
+                "tooluniverse": {
+                    "source_type": "AgenticTool",
+                    "execution": "host",
+                }
+            },
+        )(dynamic_prompt_function)
+
     def _expose_core_discovery_tools(self):
         """
         Expose only core tool discovery tools in compact mode.
@@ -1155,6 +1395,7 @@ class SMCP(FastMCP):
 
         @self.tool(
             annotations=ToolAnnotations(
+                title="Find tools by description",
                 readOnlyHint=True,  # Search tool is read-only
                 destructiveHint=False,
             )
@@ -1221,7 +1462,7 @@ class SMCP(FastMCP):
 
         # Check if ToolFinderLLM is available in loaded tools
         try:
-            all_tools = self.tooluniverse.return_all_loaded_tools()
+            all_tools = self.tooluniverse.return_all_loaded_tools(copy_tools=False)
             available_tool_names = [tool.get("name", "") for tool in all_tools]
 
             # Try ToolFinderLLM first (more advanced)
@@ -1267,7 +1508,7 @@ class SMCP(FastMCP):
                     self.logger.debug(f"Could not load tool_finder category: {e}")
 
             # Re-check availability after potential loading
-            all_tools = self.tooluniverse.return_all_loaded_tools()
+            all_tools = self.tooluniverse.return_all_loaded_tools(copy_tools=False)
             available_tool_names = [tool.get("name", "") for tool in all_tools]
 
             if "Tool_Finder_LLM" in available_tool_names:
@@ -1441,6 +1682,13 @@ class SMCP(FastMCP):
 
             enforce_bind_security(host)
 
+            # Binding to loopback is not, by itself, safe from remote browsers:
+            # DNS rebinding lets a malicious webpage resolve its own origin to
+            # 127.0.0.1 and reach this MCP endpoint as an in-browser client,
+            # with no Bearer token required. FastMCP validates Host/Origin
+            # itself once told to; ToolUniverse just needs to opt in.
+            kwargs.setdefault("host_origin_protection", "auto")
+
         # Build server URL based on transport
         if transport == "streamable-http" or transport == "http":
             self._server_url = f"http://{host}:{port}/mcp"
@@ -1537,6 +1785,7 @@ class SMCP(FastMCP):
             self.logger.info("\n🛑 Server stopped by user")
         except Exception as e:
             self.logger.error(f"❌ Server error: {e}")
+            raise
         finally:
             # Cleanup
             asyncio.run(self.close())
@@ -1556,7 +1805,9 @@ class SMCP(FastMCP):
     }
 
     @staticmethod
-    def _resolve_oneof_type(param_info: Dict[str, Any]) -> tuple:
+    def _resolve_oneof_type(
+        param_info: Dict[str, Any], *, strict: bool = False
+    ) -> tuple:
         """Convert a JSON Schema oneOf spec to (python_type, field_kwargs_update).
 
         Returns:
@@ -1568,7 +1819,12 @@ class SMCP(FastMCP):
         for item in param_info["oneOf"]:
             item_type = item.get("type")
             if item_type == "string":
-                one_of_types.append(str)
+                if strict:
+                    from pydantic import StrictStr
+
+                    one_of_types.append(StrictStr)
+                else:
+                    one_of_types.append(str)
                 one_of_schemas.append({"type": "string"})
             elif item_type == "array":
                 items = item.get("items", {})
@@ -1581,17 +1837,35 @@ class SMCP(FastMCP):
                     one_of_types.append(list)
                     one_of_schemas.append({"type": "array", "items": items})
             elif item_type == "integer":
-                one_of_types.append(int)
+                if strict:
+                    from pydantic import StrictInt
+
+                    one_of_types.append(StrictInt)
+                else:
+                    one_of_types.append(int)
                 one_of_schemas.append({"type": "integer"})
             elif item_type == "number":
-                one_of_types.append(float)
+                if strict:
+                    from pydantic import StrictFloat
+
+                    one_of_types.append(StrictFloat)
+                else:
+                    one_of_types.append(float)
                 one_of_schemas.append({"type": "number"})
             elif item_type == "boolean":
-                one_of_types.append(bool)
+                if strict:
+                    from pydantic import StrictBool
+
+                    one_of_types.append(StrictBool)
+                else:
+                    one_of_types.append(bool)
                 one_of_schemas.append({"type": "boolean"})
             elif item_type == "object":
                 one_of_types.append(dict)
                 one_of_schemas.append(item)
+            elif item_type == "null":
+                one_of_types.append(type(None))
+                one_of_schemas.append({"type": "null"})
 
         if len(one_of_types) == 0:
             python_type = str
@@ -1603,12 +1877,106 @@ class SMCP(FastMCP):
         return python_type, {"json_schema_extra": {"oneOf": one_of_schemas}}
 
     @classmethod
-    def _resolve_param_type(cls, param_info: Dict[str, Any]) -> tuple:
+    def _strict_param_type(cls, param_info: Dict[str, Any]):
+        """Build a non-coercing Python type from one JSON Schema property."""
+        from pydantic import StrictBool, StrictFloat, StrictInt, StrictStr
+
+        enum = param_info.get("enum")
+        if isinstance(enum, list) and enum:
+            return Literal[tuple(enum)]
+
+        alternatives = param_info.get("oneOf") or param_info.get("anyOf")
+        if isinstance(alternatives, list) and alternatives:
+            types = [
+                cls._strict_param_type(option)
+                for option in alternatives
+                if isinstance(option, dict)
+            ]
+            return (
+                Union[tuple(types)] if len(types) > 1 else (types[0] if types else Any)
+            )
+
+        param_type = param_info.get("type", "string")
+        if isinstance(param_type, list):
+            types = [
+                type(None)
+                if item == "null"
+                else cls._strict_param_type({**param_info, "type": item})
+                for item in param_type
+            ]
+            return Union[tuple(types)] if len(types) > 1 else types[0]
+        if param_type == "string":
+            return StrictStr
+        if param_type == "integer":
+            return StrictInt
+        if param_type == "number":
+            return StrictFloat
+        if param_type == "boolean":
+            return StrictBool
+        if param_type == "array":
+            return list[cls._strict_param_type(param_info.get("items", {}))]
+        if param_type == "object":
+            return dict
+        if param_type == "null":
+            return type(None)
+        return Any
+
+    @staticmethod
+    def _strict_field_constraints(param_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate common JSON Schema limits into Pydantic Field limits."""
+        constraints: Dict[str, Any] = {}
+        param_type = param_info.get("type")
+        # "type" may be a list. ["integer", "null"] is how an optional parameter
+        # is spelled across the shipped configs, and it is also what
+        # mcp_tool_registry._py_type_to_json_schema infers for Optional[int].
+        # The set membership test below hashes its left operand, so a list
+        # raised TypeError: unhashable type: 'list'. Narrow to the first
+        # non-null member, the same way _resolve_param_type does in its
+        # non-strict branch, so the limits are still applied. The first
+        # non-null member is the right one to read: of the 1674 list typed
+        # parameters under data/, the 59 that carry a limit are either nullable
+        # or ["array", "string"], so that member is what the limit describes.
+        if isinstance(param_type, list):
+            non_null = [item for item in param_type if item != "null"]
+            param_type = non_null[0] if non_null else None
+        if param_type == "string":
+            mapping = {
+                "minLength": "min_length",
+                "maxLength": "max_length",
+                "pattern": "pattern",
+            }
+        elif param_type in {"integer", "number"}:
+            mapping = {
+                "minimum": "ge",
+                "maximum": "le",
+                "exclusiveMinimum": "gt",
+                "exclusiveMaximum": "lt",
+                "multipleOf": "multiple_of",
+            }
+        elif param_type == "array":
+            mapping = {"minItems": "min_length", "maxItems": "max_length"}
+        else:
+            mapping = {}
+        for schema_name, field_name in mapping.items():
+            if schema_name in param_info:
+                constraints[field_name] = param_info[schema_name]
+        return constraints
+
+    @classmethod
+    def _resolve_param_type(
+        cls, param_info: Dict[str, Any], *, strict: bool = False
+    ) -> tuple:
         """Map a single JSON Schema parameter to (python_type, extra_field_kwargs).
 
         Handles oneOf, simple types, array items cleanup, and nested object cleanup.
         """
         extra: Dict[str, Any] = {}
+
+        if strict:
+            return cls._strict_param_type(param_info), {
+                "json_schema_extra": copy.deepcopy(param_info),
+                **cls._strict_field_constraints(param_info),
+            }
 
         # oneOf takes priority
         if "oneOf" in param_info:
@@ -1621,10 +1989,15 @@ class SMCP(FastMCP):
             non_null = [t for t in param_type if t != "null"]
             is_nullable = "null" in param_type
             base_type = non_null[0] if non_null else "string"
-            base_python_type = cls._SIMPLE_TYPE_MAP.get(base_type, str)
+            python_types = [cls._SIMPLE_TYPE_MAP.get(item, str) for item in non_null]
+            if len(python_types) > 1:
+                base_python_type = Union[tuple(python_types)]
+            else:
+                base_python_type = python_types[0] if python_types else str
             python_type = (
                 Optional[base_python_type] if is_nullable else base_python_type
             )
+            extra["json_schema_extra"] = {"type": param_info["type"]}
             param_type = base_type
         else:
             python_type = cls._SIMPLE_TYPE_MAP.get(param_type, str)
@@ -1636,7 +2009,13 @@ class SMCP(FastMCP):
                 if items_info
                 else {"type": "string"}
             )
-            extra["json_schema_extra"] = {"type": "array", "items": cleaned_items}
+            array_schema = {"type": "array"}
+            if items_info:
+                array_schema["items"] = cleaned_items
+            for key in ("prefixItems", "minItems", "maxItems", "uniqueItems"):
+                if key in param_info:
+                    array_schema[key] = param_info[key]
+            extra["json_schema_extra"] = array_schema
 
         elif param_type == "object":
             object_props = param_info.get("properties", {})
@@ -1694,6 +2073,19 @@ class SMCP(FastMCP):
                 properties = {}
             required_params = parameters.get("required", [])
 
+            def _schema_allows_null(schema: Dict[str, Any]) -> bool:
+                schema_type = schema.get("type")
+                if schema_type == "null":
+                    return True
+                if isinstance(schema_type, list) and "null" in schema_type:
+                    return True
+                return any(
+                    _schema_allows_null(option)
+                    for key in ("oneOf", "anyOf")
+                    for option in schema.get(key, [])
+                    if isinstance(option, dict)
+                )
+
             # Handle non-standard schema format where 'required' is set on individual properties
             # instead of at the object level (common in ToolUniverse schemas)
             if not required_params and properties:
@@ -1739,7 +2131,9 @@ class SMCP(FastMCP):
                         continue
 
                     # Resolve Python type and optional json_schema_extra
-                    python_type, extra_kwargs = self._resolve_param_type(param_info)
+                    python_type, extra_kwargs = self._resolve_param_type(
+                        param_info, strict=self.strict_input_schemas
+                    )
                     field_kwargs = {"description": param_description, **extra_kwargs}
                     pydantic_field = Field(**field_kwargs)
 
@@ -1756,15 +2150,22 @@ class SMCP(FastMCP):
                         )
                     else:
                         # Optional parameter with description, schema info and default value
-                        annotated_type = Annotated[
-                            Union[python_type, type(None)], pydantic_field
-                        ]
+                        optional_type = (
+                            python_type
+                            if self.strict_input_schemas
+                            else Union[python_type, type(None)]
+                        )
+                        annotated_type = Annotated[optional_type, pydantic_field]
                         param_annotations[safe_name] = annotated_type
                         func_params.append(
                             inspect.Parameter(
                                 safe_name,
                                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                                default=None,
+                                default=(
+                                    param_info.get("default")
+                                    if self.strict_input_schemas
+                                    else None
+                                ),
                                 annotation=annotated_type,
                             )
                         )
@@ -1793,8 +2194,18 @@ class SMCP(FastMCP):
                     args_dict = {
                         _param_name_map.get(k, k): v
                         for k, v in kwargs.items()
-                        if v is not None
+                        if v is not None or _param_name_map.get(k, k) in required_params
                     }
+                    # FastMCP validates a required nullable input before this
+                    # function, but its Pydantic invocation drops the explicit
+                    # ``None`` from kwargs. Reinsert only those already-validated
+                    # nullable required parameters; genuinely missing required
+                    # non-null inputs still fail below.
+                    for param_name in required_params:
+                        if param_name not in args_dict and _schema_allows_null(
+                            properties.get(param_name, {})
+                        ):
+                            args_dict[param_name] = None
 
                     # Check if tool supports tasks
                     execution_config = tool_config.get("execution", {})
@@ -1944,17 +2355,24 @@ class SMCP(FastMCP):
                                 {"result": result}, ensure_ascii=False
                             )
                     elif isinstance(result, (dict, list)):
-                        serialized = json.dumps(result, ensure_ascii=False, default=str)
+                        serialized = json.dumps(result, ensure_ascii=False, default=_json_default)
                     else:
                         # For other types, convert to JSON
                         serialized = json.dumps(
-                            {"result": str(result)}, ensure_ascii=False
+                            {"result": result},
+                            ensure_ascii=False,
+                            default=_json_default,
                         )
 
                     # Guard against oversized responses that overflow LLM context
                     max_chars = 100_000
                     if len(serialized) > max_chars:
-                        serialized = _truncate_response(result, serialized, max_chars)
+                        serialized = _truncate_response(
+                            result,
+                            serialized,
+                            max_chars,
+                            persist_full_result=self.persist_oversized_results,
+                        )
                     return serialized
 
                 except Exception as e:
@@ -1999,14 +2417,62 @@ Returns:
             from mcp.types import ToolAnnotations
 
             tool_annotations = ToolAnnotations(
+                # The connectors directory requires a title on every tool, and
+                # rejects a submission without one. Tools that set their own in
+                # ``mcp_annotations`` keep it; the rest get their registered
+                # name made readable, which beats shipping no title at all.
+                title=annotations_dict.get("title")
+                or _readable_tool_title(
+                    tool_config.get("original_name") or tool_config.get("name", "")
+                ),
                 readOnlyHint=annotations_dict.get("readOnlyHint"),
                 destructiveHint=annotations_dict.get("destructiveHint"),
             )
 
-            # Register with FastMCP using exposed_name for MCP, but tool execution uses original tool_name
-            self.tool(description=description, annotations=tool_annotations)(
-                dynamic_tool_function
-            )
+            if tool_config.get("mcp_schema_mode") == "passthrough":
+                from .mcp_schema_adapter import register_schema_passthrough_tool
+
+                register_schema_passthrough_tool(
+                    self,
+                    name=exposed_name,
+                    description=description,
+                    parameters=parameters,
+                    annotations=tool_annotations,
+                    fn=dynamic_tool_function,
+                )
+            else:
+                # Register with FastMCP using exposed_name for MCP, but tool
+                # execution uses original tool_name.
+                registered_tool = self.tool(
+                    description=description, annotations=tool_annotations
+                )(dynamic_tool_function)
+                if self.strict_input_schemas:
+                    # FastMCP derives discovery metadata from the Python signature.
+                    # Preserve the reviewed provider contract verbatim so omitted
+                    # optional fields are not incorrectly advertised as nullable
+                    # and bounds/enums remain visible to TOU clients.
+                    # FunctionTool is a Pydantic model whose normal assignment path
+                    # re-normalizes the schema and reintroduces nullable/default
+                    # metadata. Bypass that normalization after construction; the
+                    # callable's strict signature remains the runtime validator.
+                    strict_parameters = copy.deepcopy(parameters)
+                    object.__setattr__(registered_tool, "parameters", strict_parameters)
+                    # FastMCP 3 stores a validated copy in its local provider.
+                    # Update that copy as well; get_tool()/tools/list read it.
+                    local_provider = getattr(self, "_local_provider", None)
+                    components = getattr(local_provider, "_components", {})
+                    stored_tools = [
+                        component
+                        for component in components.values()
+                        if getattr(component, "name", None) == exposed_name
+                        and hasattr(component, "parameters")
+                    ]
+                    for stored_tool in stored_tools:
+                        object.__setattr__(
+                            stored_tool,
+                            "parameters",
+                            copy.deepcopy(strict_parameters),
+                        )
 
         except Exception as e:
             self.logger.error(f"Error creating MCP tool from config: {e}")

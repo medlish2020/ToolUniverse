@@ -14,10 +14,12 @@ gene-disease relationships for use in clinical genomics.
 import requests
 import csv
 import io
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 from .base_tool import BaseTool
 from .tool_registry import register_tool
+from .http_utils import upstream_reason_suffix
 
 # Base URLs for ClinGen APIs
 CLINGEN_BASE_URL = "https://search.clinicalgenome.org"
@@ -26,6 +28,124 @@ ACTIONABILITY_PEDIATRIC_URL = (
     "https://actionability.clinicalgenome.org/ac/Pediatric/api"
 )
 EREPO_BASE_URL = "https://erepo.clinicalgenome.org/evrepo/api"
+ALLELE_REGISTRY_URL = "https://reg.genome.network/allele"
+
+# CAid and ClinVar VariationID lookups use `summary/classifications` with exact
+# matching instead of `classifications` (confirmed live):
+#   * `classifications` stores an empty `caid` on some records, so `caid=`
+#     misses them -- CA015543 (APC c.847C>T, Pathogenic) returned nothing
+#   * its `caid` and `variationId` filters match on substring:
+#     `variationId=804` returned 57 records, `caid=CA11913` two unrelated ones
+#   * it can lag the current document version: CA16020878 is Likely
+#     Pathogenic in v2.0.0 but Uncertain Significance there
+# The summary endpoint answers a query with no match with HTTP 404. A few
+# records carry no CAid in either endpoint; a CAid with no match is retried by
+# the allele's ClinVar VariationIDs from the ClinGen Allele Registry.
+_SUMMARY_COLUMN = {"caid": "caId", "variationId": "cvId"}
+
+# Confirmed live against the Evidence Repository's `classifications` endpoint:
+#   * `gene`, `caid`, `hgvs` and `variationId` are real server-side filters
+#   * `variant` is not a parameter at all -- it is accepted and ignored, so the
+#     request degrades to an unfiltered listing of the whole repository. A
+#     deliberately bogus `variant=ZZZNOTAVARIANT` returned the same first rows
+#     as sending no filter whatsoever.
+#   * the response carries no total, and an unspecified `matchLimit` pages at 25
+# Those two facts together understated PAH by 32x -- `total: 25` reported for a
+# gene with 817 curated classifications -- and reported curated variants as
+# absent, because the old client-side narrowing ran over an arbitrary 25-row
+# page: CAID CA16020993 (PAH c.1315+1G>T) is row 401 of PAH's 817, so it was
+# answered "No variant classifications found ... Not all genes have active
+# VCEPs" when in fact the Phenylketonuria VCEP had classified it.
+#
+# The largest single gene is RUNX1 at 1,648 rows and the entire repository is
+# 13,084 rows, so this cap covers any gene-scoped query outright.
+_EREPO_MATCH_LIMIT = 5000
+
+# `data` stays capped so a listing cannot return tens of MB; `total` reports the
+# real count beside it and the gap is now disclosed rather than left to be
+# inferred from counting rows.
+_MAX_PUBLISHED = 100
+
+
+def _published(
+    rows: List[Dict[str, Any]], narrow_hint: str, total_is_capped: bool = False
+) -> Dict[str, Any]:
+    """Publish a capped slice of `rows` and state the cap beside the total.
+
+    Every listing in this module caps `data` for payload size while reporting
+    the full `total` next to it. Undisclosed, that reads as a total which
+    disagrees with the rows printed beside it: ClinGen_get_gene_validity
+    published `total: 3659` directly above exactly 100 rows, on a tool whose
+    own description promises a "comprehensive list".
+
+    `truncated` / `truncation_note` follow the repo-wide disclosure convention
+    (see cbioportal_tool._truncation_fields and clinvar_tool.
+    _truncation_disclosure) so a caller reading truncation generically does not
+    need a spelling unique to this module. `total_is_capped` marks the case
+    where the upstream request itself filled `_EREPO_MATCH_LIMIT`, which makes
+    `total` a lower bound rather than a count.
+    """
+    published = rows[:_MAX_PUBLISHED]
+    result: Dict[str, Any] = {
+        "data": published,
+        "total": len(rows),
+        "returned": len(published),
+    }
+    if total_is_capped:
+        result["truncated"] = True
+        result["truncation_note"] = (
+            f"The query filled the {_EREPO_MATCH_LIMIT}-row request cap, so "
+            f"`total` is a lower bound rather than the true count, and `data` "
+            f"carries the first {len(published)} rows. {narrow_hint}"
+        )
+    elif len(published) < len(rows):
+        result["truncated"] = True
+        result["truncation_note"] = (
+            f"`total` is the full count for this query; `data` carries only the "
+            f"first {len(published)} of them. {narrow_hint}"
+        )
+    else:
+        result["truncated"] = False
+    return result
+
+
+def _clean(value: Any) -> Optional[str]:
+    """Normalise a filter argument to a non-blank string, or None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _variant_query_param(variant: Any) -> tuple:
+    """Map a variant identifier onto the erepo parameter that filters on it.
+
+    Returns an (endpoint parameter name, value) pair. `hgvs` is the fallback
+    because it matches protein-change strings as well as full HGVS -- confirmed
+    live that `hgvs=p.Arg408Trp` resolves to a single classification.
+    """
+    value = str(variant).strip()
+    caid = value.upper().removeprefix("CAR:")
+    if re.fullmatch(r"CA\d+", caid):
+        return "caid", caid
+    if value.isdigit():
+        return "variationId", value
+    return "hgvs", value
+
+
+def _same_gene(label: Any, gene: str) -> bool:
+    """Exact HGNC symbol match; the `gene` filter matches on substring
+    server-side, so `gene=ATM` also returns GATM classifications."""
+    return str(label or "").strip().upper() == gene.upper()
+
+
+def _is_no_records(response: Any) -> bool:
+    """True for the summary endpoint's 404 meaning "no record matched"."""
+    try:
+        status = response.json().get("status") or {}
+    except ValueError:
+        return False
+    return "no records" in str(status.get("msg", "")).lower()
 
 
 @register_tool("ClinGenTool")
@@ -94,8 +214,11 @@ class ClinGenTool(BaseTool):
 
             return {
                 "status": "success",
-                "data": curations[:100],  # Limit to first 100 for performance
-                "total": len(curations),
+                **_published(
+                    curations,
+                    "Pass `gene` to narrow to one gene's curations, or use "
+                    "ClinGen_search_gene_validity, which returns every match.",
+                ),
                 "source": "ClinGen Gene-Disease Validity",
             }
         except requests.exceptions.Timeout:
@@ -103,7 +226,7 @@ class ClinGenTool(BaseTool):
         except requests.exceptions.HTTPError as e:
             return {
                 "status": "error",
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+                "error": f"HTTP {e.response.status_code}{upstream_reason_suffix(e.response)}",
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -148,7 +271,7 @@ class ClinGenTool(BaseTool):
         except requests.exceptions.HTTPError as e:
             return {
                 "status": "error",
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+                "error": f"HTTP {e.response.status_code}{upstream_reason_suffix(e.response)}",
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -187,8 +310,10 @@ class ClinGenTool(BaseTool):
 
             return {
                 "status": "success",
-                "data": curations[:100],  # Limit for performance
-                "total": len(curations),
+                **_published(
+                    curations,
+                    "Pass `gene` to narrow to one gene's dosage curations.",
+                ),
                 "include_regions": include_regions,
                 "source": "ClinGen Dosage Sensitivity",
             }
@@ -197,7 +322,7 @@ class ClinGenTool(BaseTool):
         except requests.exceptions.HTTPError as e:
             return {
                 "status": "error",
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+                "error": f"HTTP {e.response.status_code}{upstream_reason_suffix(e.response)}",
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -246,7 +371,7 @@ class ClinGenTool(BaseTool):
         except requests.exceptions.HTTPError as e:
             return {
                 "status": "error",
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+                "error": f"HTTP {e.response.status_code}{upstream_reason_suffix(e.response)}",
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -318,8 +443,10 @@ class ClinGenTool(BaseTool):
 
             return {
                 "status": "success",
-                "data": curations[:100],
-                "total": len(curations),
+                **_published(
+                    curations,
+                    "Pass `gene` to narrow to one gene's actionability curations.",
+                ),
                 "context": context,
                 "source": f"ClinGen Clinical Actionability ({context})",
             }
@@ -328,7 +455,7 @@ class ClinGenTool(BaseTool):
         except requests.exceptions.HTTPError as e:
             return {
                 "status": "error",
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+                "error": f"HTTP {e.response.status_code}{upstream_reason_suffix(e.response)}",
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -379,6 +506,9 @@ class ClinGenTool(BaseTool):
                 ("Pediatric", ACTIONABILITY_PEDIATRIC_URL),
             ]
             results = {"Adult": [], "Pediatric": []}
+            # Fix-R43-1: a failed context must not read as a genuine zero, so
+            # record which ones failed rather than swallowing the exception.
+            failures: Dict[str, str] = {}
             with ThreadPoolExecutor(max_workers=len(contexts)) as executor:
                 futures = {
                     executor.submit(
@@ -390,24 +520,44 @@ class ClinGenTool(BaseTool):
                     context = futures[future]
                     try:
                         results[context] = future.result()
-                    except Exception:
-                        # Continue with other context if one fails
-                        pass
+                    except Exception as exc:
+                        failures[context] = f"{type(exc).__name__}: {exc}"
 
-            return {
-                "status": "success",
-                "data": results,
+            response: Dict[str, Any] = {
                 "gene_searched": gene,
-                "adult_count": len(results["Adult"]),
-                "pediatric_count": len(results["Pediatric"]),
                 "source": "ClinGen Clinical Actionability",
             }
+            if failures:
+                response["failed_contexts"] = failures
+            if len(failures) == len(contexts):
+                # Both counts would be a fabricated zero. proteins_api_tool
+                # likewise reports error when nothing at all was retrieved.
+                response["status"] = "error"
+                response["error"] = (
+                    f"All ClinGen actionability contexts failed to fetch for "
+                    f"{gene}; see failed_contexts. No count can be reported."
+                )
+                return response
+
+            response.update(
+                status="success",
+                data=results,
+                adult_count=len(results["Adult"]),
+                pediatric_count=len(results["Pediatric"]),
+            )
+            if failures:
+                response["note"] = (
+                    f"Partial result: {', '.join(sorted(failures))} could not be "
+                    "fetched, so its count of 0 means 'not retrieved', not "
+                    "'no curation exists'. Retry for a complete answer."
+                )
+            return response
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
     @staticmethod
     def _flatten_classification(item: Dict[str, Any]) -> Dict[str, Any]:
-        """Map one classifications?gene=/variant= JSON record to the tool's
+        """Map one `classifications` JSON record to the tool's
         declared 7-field return_schema (Variation, ClinVar Variation Id,
         HGNC Gene Symbol, Disease, Mondo Id, Assertion, Expert Panel)."""
         hgvs = item.get("hgvs") or []
@@ -430,6 +580,110 @@ class ClinGenTool(BaseTool):
             "Expert Panel": first_agent.get("affiliation"),
         }
 
+    @staticmethod
+    def _flatten_summary_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Map one `summary/classifications` row to the same 7 fields."""
+        hgvs = row.get("hgvs") or []
+        return {
+            "Variation": hgvs[-1] if hgvs else row.get("preferredVarTitle"),
+            "ClinVar Variation Id": row.get("cvId"),
+            "HGNC Gene Symbol": row.get("gene"),
+            "Disease": row.get("condition"),
+            "Mondo Id": row.get("mondoId"),
+            "Assertion": row.get("classification"),
+            "Expert Panel": row.get("ep"),
+        }
+
+    def _summary_rows(self, key: str, value: str) -> List[Dict[str, Any]]:
+        """Summary rows whose CAid (`caid`) or ClinVar VariationID
+        (`variationId`) equals `value` exactly."""
+        column = _SUMMARY_COLUMN[key]
+        response = requests.get(
+            f"{EREPO_BASE_URL}/summary/classifications",
+            params={
+                "columns": column,
+                "values": value,
+                "matchTypes": "exact",
+                "pgSize": _EREPO_MATCH_LIMIT,
+                "pg": 1,
+            },
+            timeout=self.timeout,
+        )
+        if response.status_code == 404 and _is_no_records(response):
+            return []
+        response.raise_for_status()
+        rows = response.json().get("data") or []
+        return [r for r in rows if str(r.get(column) or "") == value]
+
+    def _clinvar_ids_for_caid(self, caid: str) -> List[str]:
+        """ClinVar VariationIDs the ClinGen Allele Registry links to `caid`."""
+        response = requests.get(f"{ALLELE_REGISTRY_URL}/{caid}", timeout=self.timeout)
+        if response.status_code == 404:
+            return []
+        response.raise_for_status()
+        records = (response.json().get("externalRecords") or {}).get(
+            "ClinVarVariations"
+        ) or []
+        return sorted({str(r["variationId"]) for r in records if r.get("variationId")})
+
+    def _lookup_by_identifier(self, key: str, value: str) -> Dict[str, Any]:
+        """Exact CAid / ClinVar VariationID lookup.
+
+        Returns the matching summary rows plus, for a CAid with no direct
+        match, the ClinVar VariationIDs tried and any Allele Registry error.
+        """
+        rows = self._summary_rows(key, value)
+        lookup: Dict[str, Any] = {"rows": rows, "clinvar_ids": [], "error": None}
+        if rows or key != "caid":
+            return lookup
+        try:
+            lookup["clinvar_ids"] = self._clinvar_ids_for_caid(value)
+        except requests.exceptions.RequestException as e:
+            lookup["error"] = str(e)
+            return lookup
+        by_uuid: Dict[Any, Dict[str, Any]] = {}
+        for clinvar_id in lookup["clinvar_ids"]:
+            for row in self._summary_rows("variationId", clinvar_id):
+                by_uuid[row.get("uuid") or id(row)] = row
+        lookup["rows"] = list(by_uuid.values())
+        return lookup
+
+    @staticmethod
+    def _empty_variant_note(
+        variant: str, key: str, value: str, gene: Optional[str], lookup: Dict
+    ) -> str:
+        scope = f" for gene '{gene}'" if gene else ""
+        if key == "caid":
+            note = (
+                f"No ClinGen Evidence Repository classification matches CAid "
+                f"'{value}'{scope}."
+            )
+            if lookup.get("error"):
+                note += (
+                    " The ClinGen Allele Registry could not be reached "
+                    f"({lookup['error']}), so records stored without a CAid "
+                    "were not checked; retry, or query by ClinVar VariationID."
+                )
+            elif lookup.get("clinvar_ids"):
+                note += (
+                    " Also checked its ClinVar VariationID(s) "
+                    f"{', '.join(lookup['clinvar_ids'])} from the ClinGen "
+                    "Allele Registry."
+                )
+        elif key == "variationId":
+            note = (
+                f"No ClinGen Evidence Repository classification matches ClinVar "
+                f"VariationID '{value}'{scope}."
+            )
+        else:
+            note = (
+                f"No classification's stored HGVS contains '{variant}'{scope}. "
+                "Each record stores one notation, so an equivalent form (another "
+                "transcript version, dup vs repeat notation) will not match; try "
+                "the CAid or ClinVar VariationID."
+            )
+        return note + " Use ClinVar_search_variants for ClinVar classifications."
+
     def _get_variant_classifications(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get variant pathogenicity classifications from ClinGen Evidence Repository.
 
@@ -437,15 +691,32 @@ class ClinGenTool(BaseTool):
         with no server-side filter and filters client-side -- confirmed live
         this routinely took 2-5+ minutes (and sometimes hung past a 300s
         client timeout) even for a gene with zero curated variants. The
-        classifications endpoint (no /all) supports server-side gene=/
-        variant= filtering and returns in ~1s -- confirmed live for both a
-        curated gene (PAH) and an uncurated one (empty result, still ~1s).
+        classifications endpoint (no /all) supports real server-side filtering.
         Calling it with neither gene nor variant set is just as unbounded as
         classifications/all (confirmed live: also hangs past 30s with no
         params), so require at least one.
+
+        A CAid or ClinVar VariationID is matched exactly on the summary
+        endpoint (see `_SUMMARY_COLUMN`). `gene` and HGVS / protein-change
+        strings are filtered by the `classifications` endpoint, with the gene
+        symbol re-checked exactly. See `_variant_query_param` and
+        `_EREPO_MATCH_LIMIT` for why the tool must name the parameter the
+        endpoint actually implements and must state its own page size.
+
+        Cost of stating the page size: asking for every row is what makes
+        `total` a count rather than a page size, and the endpoint reports no
+        total of its own, so there is no cheaper way to get it. Measured live,
+        gene queries go from 44 KB / 0.8s to 1.5 MB / ~5s (PAH) and 8.1 MB /
+        ~15s at the worst case in the repository (RUNX1, 1,648 rows). That sits
+        inside this tool's 120s timeout with roughly 8x headroom.
         """
-        gene = arguments.get("gene")
-        variant = arguments.get("variant")
+        # Strip before the guard, not after. A whitespace-only `variant` is
+        # truthy, so it satisfied "at least one filter" and then resolved to an
+        # empty `hgvs=`, sending exactly the unfiltered request this guard
+        # exists to prevent -- measured live at a full 120s timeout, with the
+        # cost paid upstream as well as here.
+        gene = _clean(arguments.get("gene"))
+        variant = _clean(arguments.get("variant"))
         if not gene and not variant:
             return {
                 "status": "error",
@@ -458,51 +729,79 @@ class ClinGenTool(BaseTool):
                 ),
             }
         try:
-            params = {}
-            if gene:
-                params["gene"] = gene
+            variant_key = variant_value = None
             if variant:
-                params["variant"] = variant
+                variant_key, variant_value = _variant_query_param(variant)
 
-            response = requests.get(
-                f"{EREPO_BASE_URL}/classifications", params=params, timeout=self.timeout
-            )
-            response.raise_for_status()
-            payload = response.json()
-            items = payload.get("variantInterpretations", [])
+            lookup: Dict[str, Any] = {}
+            if variant_key in _SUMMARY_COLUMN:
+                lookup = self._lookup_by_identifier(variant_key, variant_value)
+                rows = lookup["rows"]
+                if gene:
+                    rows = [r for r in rows if _same_gene(r.get("gene"), gene)]
+                data = [self._flatten_summary_row(r) for r in rows]
+                capped = False
+            else:
+                params: Dict[str, Any] = {"matchLimit": _EREPO_MATCH_LIMIT}
+                if gene:
+                    params["gene"] = gene
+                if variant_key:
+                    params[variant_key] = variant_value
 
-            # The upstream `variant=` param resolves to that variant's gene
-            # and returns every variant for the gene, not just the one
-            # requested (confirmed live: variant=CA114360 returns 25 PAH
-            # rows, not 1) -- narrow back down to an exact match on the
-            # variant's own identifiers/HGVS forms.
-            if variant:
-                variant_str = str(variant).upper()
-                items = [
-                    item
-                    for item in items
-                    if variant_str in str(item.get("caid", "")).upper()
-                    or variant_str == str(item.get("variationId", "")).upper()
-                    or any(variant_str in h.upper() for h in item.get("hgvs") or [])
-                ]
+                response = requests.get(
+                    f"{EREPO_BASE_URL}/classifications",
+                    params=params,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                items = payload.get("variantInterpretations", [])
+                capped = len(items) >= _EREPO_MATCH_LIMIT
+                if gene:
+                    items = [
+                        i
+                        for i in items
+                        if _same_gene((i.get("gene") or {}).get("label"), gene)
+                    ]
 
-            data = [self._flatten_classification(item) for item in items]
+                # Flattening every row and publishing 100 wastes ~0.6ms at the
+                # repository's worst case (RUNX1, 1,648 rows), against a ~15s
+                # round trip. Slicing first would make `total` count the slice
+                # instead of the query, so the list stays whole.
+                data = [self._flatten_classification(item) for item in items]
 
             result = {
                 "status": "success",
-                "data": data[:100],
-                "total": len(data),
+                **_published(
+                    data,
+                    "Pass `variant` (a ClinGen CAID, a ClinVar VariationID or an "
+                    "HGVS/protein-change string) to retrieve a specific row.",
+                    # No gene can fill the cap -- the largest is RUNX1 at 1,648
+                    # -- but `hgvs` matches on substring, so a short fragment
+                    # can sweep the repository. Reachable, and `total` would be
+                    # a floor rather than a count if it were reached.
+                    total_is_capped=capped,
+                ),
                 "source": "ClinGen Evidence Repository",
             }
-            if not data:
-                queried = f"gene '{gene}'" if gene else f"variant '{variant}'"
+            if data and lookup.get("clinvar_ids"):
                 result["note"] = (
-                    f"No variant classifications found for {queried}. "
+                    f"Matched through ClinVar VariationID(s) "
+                    f"{', '.join(lookup['clinvar_ids'])}: the Evidence Repository "
+                    f"stores this classification without CAid '{variant_value}'."
+                )
+            elif not data and variant:
+                result["note"] = self._empty_variant_note(
+                    variant, variant_key, variant_value, gene, lookup
+                )
+            elif not data:
+                result["note"] = (
+                    f"No variant classifications found for gene '{gene}'. "
                     "The ClinGen Evidence Repository only contains variants "
-                    "curated by Variant Curation Expert Panels (VCEPs). "
-                    "Not all genes have active VCEPs. Try ClinGen_get_gene_validity "
-                    "for gene-disease validity or clinvar_search_variants for "
-                    "ClinVar variant classifications."
+                    "curated by Variant Curation Expert Panels (VCEPs), and "
+                    "not all genes have an active VCEP. Try "
+                    "ClinGen_get_gene_validity for gene-disease validity or "
+                    "ClinVar_search_variants for ClinVar classifications."
                 )
             return result
         except requests.exceptions.Timeout:
@@ -510,7 +809,7 @@ class ClinGenTool(BaseTool):
         except requests.exceptions.HTTPError as e:
             return {
                 "status": "error",
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+                "error": f"HTTP {e.response.status_code}{upstream_reason_suffix(e.response)}",
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}

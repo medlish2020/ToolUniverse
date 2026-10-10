@@ -8,6 +8,36 @@ when_to_use: "A factual biomedical question has a single database-checkable answ
 
 Factual biomedical questions — "which gene is in set X", "which gene is associated with disease Y according to DisGeNet", "which gene has a TF binding site per GTRD" — have an authoritative answer in a public database. Guessing from memory is unreliable (≈chance on niche annotations); the matching ToolUniverse tool returns the ground truth.
 
+## Six traps that produce a confidently wrong answer
+
+Each was observed producing a wrong answer on a real question. Check them before
+answering; the detail for each is further down.
+
+1. **"Highest p-value" in GWAS means most significant** — the *smallest* number.
+   Read literally it picks the study's weakest hit (`rs2476491` at 1e-06 instead
+   of `rs7775055-G` at 3e-174).
+
+2. **A window of "N bp upstream plus M bp downstream" spans N+M+1 bases** — the
+   anchor counts. 100 either side of a TSS is 201 nt, not 200. Check the length
+   you got against the length you asked for.
+
+3. **HPA subcellular locations pool every cell line the antibody was tested in.**
+   Report both `main_locations` and `additional_locations`, but when the question
+   names a line, treat them as candidates and drop annotations belonging to
+   another line — reciting all five is as wrong as reciting one.
+
+4. **Allen Brain: answer the leaf structure, not its parent.** The atlas colours
+   the specific structure and gives the parent a different colour, so
+   "Hypothalamus" is wrong where `Lateral preoptic area` (#F2483B) is right.
+   `AllenBrain_search_structures` returns `color_hex_triplet`.
+
+5. **SCREEN's `is_proximal` is unreliable; filter on `element_type`** — `PLS`
+   and `pELS` are TSS-proximal, `dELS` distal.
+
+6. **Derived scores are release-pinned.** gnomAD pLI for APOC2 is 0.047 in r4
+   and 0.402 in r2.1 — an 8.5x difference for the same gene. Set the release the
+   question names and say which you used.
+
 ## RULE ZERO: Look it up, never guess
 
 If a question names a database, a gene set, or any annotation that lives in a database, you MUST query the tool before answering. Answering a "according to <database>" question from memory is a failure mode — these annotations (predicted miRNA targets, ChIP-seq binding, curated gene sets, disease associations) are exactly what models hallucinate. A tool-verified answer beats any recalled fact.
@@ -34,7 +64,7 @@ Most of these questions are MCQ with an "Insufficient information to answer the 
 | **mouse phenotype** gene set (MP / MGI, e.g. "increased melanoma incidence") | `MSigDB_check_gene_in_set` (mouse M5, set `MP_<PHENOTYPE>`) — fall back to `MGI_search_genes` → `MGI_get_phenotypes` | **one call per option** against the `MP_*` set (e.g. `MP_INCREASED_MELANOMA_INCIDENCE`); the member is the answer. Only if the set name doesn't resolve, use the MGI per-gene route below |
 | **gene genomic location** (Ensembl band, e.g. chr7q34) | `Ensembl_*` / `NCBIDatasets_get_gene_by_symbol` | resolve each option, compare cytoband/coordinates |
 | **variant / sequence** pathogenicity ("which variant/sequence is pathogenic *or* benign per ClinVar") | (only when genuinely unsure) `annotate_variant_multi_source`, `VEP_predict_pathogenicity`, `UniProt_get_disease_variants_by_accession` | **Be efficient — do NOT query every option (that causes timeouts).** Identify the protein once, find each option's single substitution, and reason about the specific residue changes directly; the base model is usually reliable on well-characterized ClinVar variants. Make at most ONE targeted tool call to resolve a truly uncertain variant. **Watch the question's polarity** (benign vs pathogenic): for "most likely benign", a common/reference-matching variant is the answer; for "most likely pathogenic", a rare damaging one is. |
-| **drug / compound** target, MoA, approval | `ChEMBL_*`, `OpenFDA_*`, `GtoPdb_*`, `PubChem_*` | resolve drug, query the relation |
+| **drug / compound** target, MoA, approval | `ChEMBL_*`, `OpenFDA_*`, `GtoPdb_*` (needs `GTOPDB_API_KEY`), `PubChem_*` | resolve drug, query the relation |
 | **which drug for this patient** (clinical vignette naming a modifier) | `FDA_*_by_drug_name` — pick the section by modifier | see "Drug choice for a described patient" below |
 | **protein** function / domain / sequence | `UniProt_*` | resolve accession, read annotation |
 | **protein localization / expression** "according to the Human Protein Atlas" | `HPA_get_subcellular_location`, `HPA_get_rna_expression_by_source`, `HPA_get_comprehensive_gene_details_by_ensembl_id` | pass the gene symbol — an **antibody ID such as `HPA073143` also works** and resolves to its target gene. **Report main *and* additional locations** — see below |

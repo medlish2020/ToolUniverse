@@ -10,7 +10,6 @@ from .base_rest_tool import BaseRESTTool
 from .base_tool import BaseTool
 from .openfda_adv_tool import faers_drug_name_clause
 from .tool_registry import register_tool
-import os
 import urllib.parse
 
 # Cache for GraphQL query to avoid repeated string operations
@@ -134,8 +133,15 @@ def _execute_opentargets_query(chembl_id):
 
         query = _get_drug_names_query()
         variables = {"chemblId": chembl_id}
+        # Fix-47-5: same missing-timeout defect as the openFDA calls below --
+        # this one is only reachable if graphql_tool fails to import, but an
+        # unbounded POST hangs the tool just as completely from a fallback
+        # path as from the main one. The primary path already passes
+        # timeout=30 (graphql_tool.execute_query), so this matches it.
         response = requests.post(
-            _OPENTARGETS_ENDPOINT, json={"query": query, "variables": variables}
+            _OPENTARGETS_ENDPOINT,
+            json={"query": query, "variables": variables},
+            timeout=30,
         )
         try:
             result = response.json()
@@ -163,6 +169,67 @@ def check_keys_present(api_capabilities_dict, keys):
     return key_present
 
 
+# openFDA fields that are IDENTIFIERS or name blocks rather than prose, and so
+# must be copied verbatim rather than keyword-trimmed.
+#
+# Keyword trimming keeps the sentences of a long label section that mention the
+# caller's search terms. An identifier has no sentences, so trimming one returns
+# the empty string -- and "" is then published as if it were the field's value.
+# Measured live 2026-08-12:
+#
+#   FDA_get_drug_label_info_by_field_value
+#     {"field": "precautions", "field_value": "Loa loa",
+#      "return_fields": ["id", "set_id", "openfda.generic_name"]}
+#   -> "id": "", "set_id": "", while openfda.generic_name populated correctly
+#
+# The SPL set id is the only stable handle for a label version, and the tool's
+# own description recommends both fields, so the loss is silent and total: even
+# round-tripping a known set_id back into the tool matched the right label and
+# still returned "".
+#
+# This replaces a hard-coded `key != "openfda" and key != "generic_name" and
+# key != "brand_name"` chain. The rule was always "don't trim non-prose", but
+# stating it as a named set is what lets a new identifier field be added in one
+# place instead of growing another `and key != ...`.
+NEVER_KEYWORD_TRIMMED = frozenset(
+    {
+        # Name blocks -- short values where a keyword filter can only destroy.
+        "openfda",
+        "generic_name",
+        "brand_name",
+        "substance_name",
+        "manufacturer_name",
+        "spl_product_data_elements",
+        # Document identifiers and versioning.
+        "id",
+        "set_id",
+        "spl_id",
+        "spl_set_id",
+        "application_number",
+        "product_ndc",
+        "effective_time",
+        "version",
+        "rxcui",
+        "unii",
+    }
+)
+
+
+def contributes_content_keywords(field):
+    """Whether a searched field's value may also trim returned section text.
+
+    The keyword filter exists to cut a long label section down to the sentences
+    that match what was searched for. That only makes sense when the search term
+    is content. An identifier, a version stamp or a name block says nothing
+    about which sentences matter, so using it as a content filter can only
+    delete text: fetching a label by ``id`` and asking for its sections used to
+    come back empty for exactly this reason.
+    """
+    if isinstance(field, tuple):
+        return all(contributes_content_keywords(part) for part in field)
+    return str(field).split(".")[-1] not in NEVER_KEYWORD_TRIMMED
+
+
 def extract_nested_fields(
     records, fields, keywords=None, identity_fields=None, sibling_sections=None
 ):
@@ -172,7 +239,7 @@ def extract_nested_fields(
     :param records: List of dictionaries from which to extract fields
     :param fields: List of nested fields to extract, each specified with dot notation (e.g., 'openfda.brand_name')
     :param keywords: Optional keyword list used to trim long sections down to
-        matching sentences.
+        matching sentences. ``*_table`` fields are never trimmed.
     :param identity_fields: Optional extra fields copied verbatim (never keyword
         trimmed) onto every kept record. They exist so a caller can identify the
         product when the ``openfda`` block is empty. They deliberately do NOT
@@ -200,15 +267,28 @@ def extract_nested_fields(
             try:
                 for key in keys:
                     value = value[key]
-                if key != "openfda" and key != "generic_name" and key != "brand_name":
-                    if len(keywords) > 0:
-                        # print("key words:", keywords)
-                        # print(value)
-                        # print(type(value))
-                        value = extract_sentences_with_keywords(value, keywords)
+                if (
+                    key not in NEVER_KEYWORD_TRIMMED
+                    and not field.endswith("_table")
+                    and keywords
+                ):
+                    value = extract_sentences_with_keywords(value, keywords)
                 extracted_record[field] = value
             except KeyError:
                 extracted_record[field] = None
+        # openFDA files a section's tables separately, under `<section>_table`
+        # (dose by renal function, adverse-reaction incidence, ...). Asking for a
+        # section returned its prose, which often just says "see Table 1", and
+        # dropped the table. Copy the tables of the requested sections from this
+        # same record, HTML intact and never keyword-trimmed: sentence trimming
+        # would cut a table's rows apart from its header.
+        if isinstance(record, dict):
+            for field in fields:
+                if "." in field or field.endswith("_table"):
+                    continue
+                table_field = field + "_table"
+                if record.get(table_field):
+                    extracted_record[table_field] = copy.deepcopy(record[table_field])
         keep = any(extracted_record.values())
         for field in identity_fields or []:
             if field in extracted_record:
@@ -271,6 +351,190 @@ def map_properties_to_openfda_fields(arguments, search_fields):
     return arguments
 
 
+# ===== Excipient-match guard =====
+#
+# `drug_name` on all 77 `FDA_*_by_drug_name` label tools is OR'd across
+# `openfda.brand_name`, `openfda.generic_name` and `spl_product_data_elements`.
+# The first two are openFDA's *resolved* identity for the record; the third is the
+# raw product/ingredient blob, which is there on purpose -- it is the only name
+# field on the many SPL records whose `openfda` block openFDA never resolved (see
+# tests/unit/test_fda_label_name_match_completeness.py). But the blob also lists
+# EXCIPIENTS, so it matches any product that merely CONTAINS the queried
+# substance.
+#
+# Measured live on openFDA drug/label (2026-08-11):
+#
+#   spl_product_data_elements:"ALBUMINEX"                     ->   3 labels
+#     AND _exists_:boxed_warning                              ->   1  (BEIZRAY,
+#         a docetaxel product that co-packages Albuminex as an excipient)
+#   openfda.brand_name:"ALBUMINEX"                            ->   2  (genuine)
+#     AND _exists_:boxed_warning                              ->   0  (the truth:
+#         Albuminex, a plasma-derived albumin, has no boxed warning)
+#
+# So `FDA_get_boxed_warning_info_by_drug_name {"drug_name":"Albuminex"}` returned
+# DOCETAXEL's boxed warning -- toxic deaths, neutropenia, hypersensitivity -- as
+# if it were the albumin product's: the `_exists_` guard deleted both genuine
+# labels (correctly boxed-warning-free) and left only the wrong drug's.
+#
+# The discriminator is NOT which field matched -- that is not visible per record
+# and, for the unresolved records, the blob is the only field that COULD match.
+# It is whether the record's own resolved identity CONTRADICTS the query:
+#
+#   drop a record iff it carries a resolved openFDA name block AND none of its
+#   resolved names contains the queried name; keep every record whose openFDA
+#   block is empty/unresolved, since it has no resolved identity to contradict
+#   the blob match.
+#
+# Measured with that rule against 100-record samples of
+# `spl_product_data_elements:"<name>"` (match / unresolved / contradicted):
+#
+#   Albuminex        3    2 / 0 / 1   drops BEIZRAY/DOCETAXEL  <- the defect
+#   denosumab       25   19 / 6 / 0   recall fix fully preserved
+#   aspirin       2223   43 / 57 / 0
+#   metformin     1063   44 / 56 / 0
+#   warfarin       285   26 / 74 / 0
+#   docetaxel       58   32 / 26 / 0
+#   Humira           5    3 / 2 / 0
+#   Eliquis         14    8 / 6 / 0
+#   albumin human  122    3 / 57 / 40  TachoSil/THROMBIN, PROCRIT/ERYTHROPOIETIN
+#   polysorbate 80 14275  0 / 55 / 45  Mekinist/TRAMETINIB, ...
+#   sodium chloride 20446 2 / 58 / 40  OASIS Tears/GLYCERIN, ...
+#
+# i.e. zero drops for ordinary drug-name lookups, drops confined to genuine
+# excipient contamination.
+RESOLVED_IDENTITY_FIELDS = ("brand_name", "generic_name", "substance_name")
+
+# The resolved name fields a `drug_name` search may be OR'd across. Presence of
+# one of these ALONGSIDE the ingredient blob is what makes a query ambiguous
+# between "product named X" and "product containing X"; a blob-only search
+# (FDA_get_drug_names_by_ingredient) is an ingredient lookup by design and is
+# left alone.
+_RESOLVED_SEARCH_FIELDS = frozenset(
+    {"openfda.brand_name", "openfda.generic_name", "openfda.substance_name"}
+)
+
+NOT_FOUND_RESPONSE = {"error": {"code": "NOT_FOUND", "message": "No matches found!"}}
+
+
+def _excipient_guard_term(search_fields):
+    """The queried name, when the query is the ambiguous name/ingredient shape.
+
+    Returns ``None`` -- i.e. disarms the guard -- unless some single filter ORs
+    the ingredient blob together with at least one resolved openFDA name field.
+    That restricts it to the 77 ``FDA_*_by_drug_name`` label tools and leaves
+    ``FDA_get_drug_names_by_ingredient`` (blob only) and the two openfda-only
+    tools exactly as they were.
+    """
+    for field, value in (search_fields or {}).items():
+        if not isinstance(field, tuple):
+            continue
+        if "spl_product_data_elements" not in field:
+            continue
+        if not _RESOLVED_SEARCH_FIELDS.intersection(field):
+            continue
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _excipient_text_fields(search_fields):
+    """The non-name fields the guarded filter searches, i.e. the real match route.
+
+    A row the guard drops matched the query through one of these and NOT through
+    a resolved openFDA name -- that is the definition of the drop. Naming them is
+    what keeps the caller-facing note true after a broadening stage has replaced
+    the field set: the note used to assert ``spl_product_data_elements`` was the
+    route unconditionally, which is false for a Stage-B query that also searched
+    ``indications_and_usage`` / ``description``.
+    """
+    for field, value in (search_fields or {}).items():
+        if not isinstance(field, tuple):
+            continue
+        if "spl_product_data_elements" not in field:
+            continue
+        if not _RESOLVED_SEARCH_FIELDS.intersection(field):
+            continue
+        if isinstance(value, str) and value.strip():
+            return [f for f in field if f not in _RESOLVED_SEARCH_FIELDS]
+    return []
+
+
+def _resolved_identity_text(record):
+    """Every name openFDA itself resolved for ``record``, folded and joined.
+
+    Empty when the record's ``openfda`` block is absent or carries none of the
+    name fields -- the unresolved-record case, which the caller must KEEP.
+    """
+    if not isinstance(record, dict):
+        return ""
+    openfda = record.get("openfda")
+    if not isinstance(openfda, dict):
+        return ""
+    parts = []
+    for field in RESOLVED_IDENTITY_FIELDS:
+        value = openfda.get(field)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            parts.extend(str(v) for v in value if v)
+    return " ".join(parts).lower()
+
+
+def _returned_row_identity_text(record):
+    """``_resolved_identity_text`` for a row in the shape the CALLER receives.
+
+    ``extract_nested_fields`` flattens ``openfda.brand_name`` & co into top-level
+    dotted keys, so the raw-shape reader above returns "" for every returned row
+    and would report the whole page as unresolved. Counting on the returned rows
+    -- rather than on the pre-limit ``kept`` list -- is what makes the note's
+    "N of the returned label(s)" literally checkable against ``results``.
+    """
+    text = _resolved_identity_text(record)
+    if text:
+        return text
+    if not isinstance(record, dict):
+        return ""
+    parts = []
+    for field in RESOLVED_IDENTITY_FIELDS:
+        value = record.get(f"openfda.{field}")
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            parts.extend(str(v) for v in value if v)
+    return " ".join(parts).lower()
+
+
+def _drop_excipient_matches(records, queried_name):
+    """Split ``records`` into (kept, dropped_count) by the rule described above.
+
+    The name test is a case-insensitive SUBSTRING test so combination products
+    still pass: "aspirin" matches the generic name
+    "ACETAMINOPHEN, ASPIRIN, AND CAFFEINE". A multi-word query additionally
+    passes when every one of its words appears, because openFDA punctuates
+    combination names ("ACETAMINOPHEN AND CODEINE PHOSPHATE") in ways the phrase
+    search itself normalises away -- erring towards keeping, since a wrong drop
+    costs recall while a wrong keep is merely the pre-existing behaviour.
+    """
+    needle = " ".join(str(queried_name or "").lower().split())
+    if not needle:
+        return list(records), 0
+    words = [w for w in needle.split(" ") if w]
+    kept = []
+    dropped = 0
+    for record in records:
+        identity = _resolved_identity_text(record)
+        if not identity:
+            # No resolved identity to contradict the blob match. This is the
+            # denosumab recall case (XBRYK, OSPOMYV, BILDYOS ...).
+            kept.append(record)
+            continue
+        if needle in identity or (len(words) > 1 and all(w in identity for w in words)):
+            kept.append(record)
+            continue
+        dropped += 1
+    return kept, dropped
+
+
 def extract_sentences_with_keywords(text_list, keywords):
     """
     Extracts sentences containing any of the specified keywords from the text.
@@ -298,6 +562,45 @@ def extract_sentences_with_keywords(text_list, keywords):
                 sentences_with_keywords.append(sentence)
 
     return "......".join(sentences_with_keywords)
+
+
+# Fix-47-5: the calls into api.fda.gov were issued with no `timeout=` and
+# their bodies decoded with a bare `response.json()`. Both halves fail badly.
+# Without a timeout a stalled connection hangs the tool indefinitely, and
+# openFDA's CDN serves HTML (not JSON) error pages under load, so the decode
+# raised out of the tool and was reported to the caller as
+# "Validation error: Expecting value: line 1 column 1 (char 0)" with
+# `retriable: false` and the advice "Check parameter types and values" --
+# blaming a perfectly good query for the FDA being briefly unavailable, and
+# ruling out the one action that would have worked. Both are transport
+# failures and are reported as such, in openFDA's own error shape so they
+# flow through the same disclosure path as any other upstream error.
+_OPENFDA_TIMEOUT = 30
+
+
+def _openfda_get(url, timeout=_OPENFDA_TIMEOUT):
+    """GET an openFDA URL and decode it, as openFDA-shaped data or error."""
+    try:
+        response = requests.get(url, timeout=timeout)
+    except Exception as exc:
+        return {
+            "error": {
+                "code": "TRANSPORT_ERROR",
+                "message": f"Could not reach openFDA ({type(exc).__name__}: {exc})",
+            }
+        }
+    try:
+        return response.json()
+    except Exception:
+        return {
+            "error": {
+                "code": "BAD_JSON",
+                "message": (
+                    "openFDA returned a non-JSON response "
+                    f"(HTTP {getattr(response, 'status_code', 'unknown')})"
+                ),
+            }
+        }
 
 
 def search_openfda(
@@ -370,11 +673,7 @@ def search_openfda(
                 continue
 
             # Merge multiple continuous black spaces into one and use one '+'
-            if (
-                keywords_filter
-                and field != "openfda.brand_name"
-                and field != "openfda.generic_name"
-            ):
+            if keywords_filter and contributes_content_keywords(field):
                 keywords_list.extend(value.split())
             if field == "openfda.generic_name":
                 value = value.upper()  # all generic names are in uppercase
@@ -547,16 +846,98 @@ def search_openfda(
             return False
         return True
 
+    # ===== Excipient-match guard (see _drop_excipient_matches) =====
+    # Armed only for the ambiguous "name OR ingredient blob" query shape, and
+    # applied to EVERY payload this function accepts -- the first response and
+    # each broadening/probe re-query alike -- because the broadening stages
+    # search the same blob and would otherwise re-admit exactly the rows the
+    # first pass rejected. It is a pure local filter: no extra round-trip.
+    excipient_term = _excipient_guard_term(orig_search_fields)
+    # The fields the caller's own query searches besides the resolved openFDA
+    # names. Broadening stages replace this per re-query (see `_run_search`).
+    excipient_default_fields = _excipient_text_fields(orig_search_fields)
+    # Number of rows the guard removed from the payload currently held in
+    # `response_data`. Overwritten, not accumulated, so it always describes the
+    # payload actually returned rather than the sum of abandoned attempts.
+    excipient_dropped = 0
+    # The fields through which the dropped rows actually matched, for the payload
+    # currently held. Overwritten per payload for the same reason.
+    excipient_matched_via = list(excipient_default_fields)
+    # Whether the `meta.total` correction below is EXACT. It is exact only when
+    # the page the guard inspected covered the entire result set; otherwise only
+    # this page's drops are observable and the corrected number is an upper
+    # bound. The note has to say which, because the two differ by 2.3x on a real
+    # query ({"drug_name": "albumin human", "limit": 10} reported 37 against a
+    # true post-guard total of 16).
+    excipient_total_exact = True
+    excipient_total_upstream = None
+    excipient_total_corrected = None
+    excipient_page_rows = 0
+
+    def _guard_excipients(payload, text_fields=None):
+        """Drop excipient-only matches from an openFDA payload.
+
+        When that empties the payload it is turned into openFDA's own NOT_FOUND
+        shape rather than an empty success, so the existing machinery -- the
+        sibling-section retry and the `section_exists_clause` re-probe that
+        tells "no such drug" apart from "drug matched, section absent" -- still
+        engages. That is what turns the Albuminex query into the honest answer
+        (2 labels, no boxed warning, warnings_and_cautions present) instead of a
+        dead end.
+        """
+        nonlocal excipient_dropped, excipient_matched_via
+        nonlocal excipient_total_exact, excipient_total_upstream
+        nonlocal excipient_total_corrected, excipient_page_rows
+        if not excipient_term or not isinstance(payload, dict):
+            return payload
+        rows = payload.get("results")
+        if not isinstance(rows, list) or not rows:
+            return payload
+        kept, dropped = _drop_excipient_matches(rows, excipient_term)
+        excipient_dropped = dropped
+        excipient_matched_via = list(text_fields or excipient_default_fields)
+        excipient_total_exact = True
+        excipient_total_upstream = None
+        excipient_total_corrected = None
+        excipient_page_rows = len(rows)
+        if not dropped:
+            return payload
+        if not kept:
+            return copy.deepcopy(NOT_FOUND_RESPONSE)
+        payload = dict(payload)
+        payload["results"] = kept
+        # Keep `meta.total` describing the answer rather than the raw upstream
+        # hit count: reporting "3 labels" for Albuminex when one of them is a
+        # docetaxel product is the same misstatement in smaller print.
+        #
+        # Only THIS page's drops are observable, so the subtraction is exact
+        # only when the page held the whole result set; otherwise it is an upper
+        # bound. Record which case this is so `_attach_notes` can say so instead
+        # of asserting a correctness the number does not have.
+        meta = payload.get("meta")
+        results_meta = meta.get("results") if isinstance(meta, dict) else None
+        if isinstance(results_meta, dict) and isinstance(
+            results_meta.get("total"), int
+        ):
+            total = results_meta["total"]
+            skip = results_meta.get("skip") or 0
+            excipient_total_upstream = total
+            excipient_total_exact = not skip and len(rows) >= total
+            results_meta = dict(results_meta)
+            results_meta["total"] = max(total - dropped, len(kept))
+            excipient_total_corrected = results_meta["total"]
+            meta = dict(meta)
+            meta["results"] = results_meta
+            payload["meta"] = meta
+        return payload
+
     full_url = f"{endpoint_url}?{query}"
     used_api_key = False
     if _is_valid_api_key(api_key):
         full_url += f"&api_key={api_key}"
         used_api_key = True
 
-    response = requests.get(full_url)
-
-    # Get the JSON response
-    response_data = response.json()
+    response_data = _openfda_get(full_url)
 
     # If an invalid API key was supplied, retry once without it.
     if (
@@ -565,8 +946,9 @@ def search_openfda(
         and isinstance(response_data.get("error"), dict)
         and response_data["error"].get("code") == "API_KEY_INVALID"
     ):
-        response = requests.get(f"{endpoint_url}?{query}")
-        response_data = response.json()
+        response_data = _openfda_get(f"{endpoint_url}?{query}")
+
+    response_data = _guard_excipients(response_data)
 
     # ===== Generic NOT_FOUND fallback engine (applies to all FDADrugLabel tools) =====
     requested_return_fields = return_fields
@@ -671,7 +1053,11 @@ def search_openfda(
             return search_str
         return search_str + "+AND+(" + "+OR+".join(f"_exists_:{e}" for e in ex) + ")"
 
-    def _run_search(search: str, limit_override: int | None = None) -> dict | None:
+    def _run_search(
+        search: str,
+        limit_override: int | None = None,
+        text_fields: list[str] | None = None,
+    ) -> dict | None:
         p = {k: v for k, v in params.items() if k != "search"}
         p["search"] = search
         if limit_override is not None:
@@ -686,14 +1072,7 @@ def search_openfda(
         url = f"{endpoint_url}?{q}"
         if _is_valid_api_key(api_key):
             url += f"&api_key={api_key}"
-        resp = requests.get(url)
-        try:
-            return resp.json()
-        except Exception:
-            return {
-                "status": "error",
-                "error": {"code": "BAD_JSON", "message": "Non-JSON response"},
-            }
+        return _guard_excipients(_openfda_get(url), text_fields=text_fields)
 
     # Only run fallbacks on NOT_FOUND
     if (
@@ -846,7 +1225,14 @@ def search_openfda(
             per_field = [f"{f}:({term_expr})" for f in fields_b]
             search_b = _guarded("(" + "+OR+".join(per_field) + ")", set(fields_b))
             tmp = _run_search(
-                search_b, limit_override=max(int(params.get("limit") or 0), 25)
+                search_b,
+                limit_override=max(int(params.get("limit") or 0), 25),
+                # This stage searches MORE than the ingredient blob, so a row the
+                # excipient guard drops here may have matched
+                # `indications_and_usage` / `description` instead. Hand the real
+                # field set to the guard or its note names the wrong route and
+                # sends the reader to a field that does not contain the term.
+                text_fields=[f for f in fields_b if f not in _RESOLVED_SEARCH_FIELDS],
             )
             if isinstance(tmp, dict) and "error" not in tmp:
                 response_data = tmp
@@ -987,6 +1373,141 @@ def search_openfda(
                 except Exception:
                     pass
 
+    def _excipient_total_sentence():
+        """State what the guard did to ``meta.total`` -- and how far to trust it.
+
+        The subtraction only ever sees the rows on the page it was handed, so on
+        a result set that spans pages the corrected number is an UPPER BOUND, not
+        a count. Asserting "reduced accordingly" in that case is the same class
+        of over-claim the guard exists to remove, one level up: measured live,
+        ``{"drug_name": "albumin human", "limit": 10}`` reported meta.total 37
+        against a true post-guard total of 16.
+        """
+        if excipient_total_corrected is None:
+            # openFDA sent no usable `meta.results.total`; nothing was corrected,
+            # so nothing may be claimed about it.
+            return ""
+        if excipient_total_exact:
+            return (
+                f" meta.total was reduced accordingly, to {excipient_total_corrected}."
+            )
+        return (
+            f" meta.total ({excipient_total_corrected}) was reduced by the "
+            f"{excipient_dropped} drop(s) visible on THIS page only -- openFDA "
+            f"reported {excipient_total_upstream} hit(s) and this page carried "
+            f"{excipient_page_rows} row(s), so the rest of the result set was "
+            f"never inspected. Treat meta.total as an UPPER BOUND on the "
+            f"post-filter total, not an exact count; raise 'limit' until the "
+            f"whole result set fits on one page to get an exact number."
+        )
+
+    def _attach_notes(out):
+        """Put every caveat under the existing ``note`` key, none overwriting another."""
+        parts = []
+        if fallback_note:
+            parts.append(fallback_note)
+        # The fields the guarded query actually searched. Naming them, rather
+        # than hard-coding `spl_product_data_elements`, is what keeps this true
+        # after a broadening stage: `FDA_get_child_safety_info_by_drug_name
+        # {"drug_name": "minocycline"}` searches indications_and_usage and
+        # description as well, and none of its returned rows contains
+        # "minocycline" in the ingredient blob the old wording named.
+        route = ", ".join(excipient_matched_via or ["spl_product_data_elements"])
+        if excipient_dropped:
+            parts.append(
+                f"{excipient_dropped} label(s) matched '{excipient_term}' only "
+                f"through the label text searched ({route}) -- not through a "
+                f"resolved product name -- while their own openFDA brand / "
+                f"generic / substance names identify a DIFFERENT product -- a "
+                f"combination or co-packaged product that merely contains "
+                f"'{excipient_term}' as an ingredient. Those rows were dropped."
+                + _excipient_total_sentence()
+            )
+        # State the limit of the guard, but only once it has actually caught
+        # contamination on this query: a row whose openFDA block is empty has no
+        # resolved identity, so the guard could not test it and it may still be
+        # an unrelated product. Claiming the answer "describes <term> itself"
+        # here would be false precisely when it matters -- a `minocycline`
+        # lookup whose surviving rows are all zinc gluconate lozenges.
+        #
+        # Gated on `excipient_dropped` because an unresolved openFDA block is
+        # the NORMAL shape for a large minority of genuine labels: 6 of the 25
+        # real denosumab products have one. Warning whenever any unresolved row
+        # is returned would fire on nearly every clean lookup and train the
+        # reader to skip the note, which is how the caveat stops being read on
+        # the queries that need it.
+        #
+        # Counted over the rows in THIS payload, not over the guard's pre-limit
+        # `kept` list: `extracted_results` is truncated by the caller's `limit`
+        # after the guard runs, so the pre-limit count produced sentences like
+        # "12 of the returned label(s)" on a response holding 3. The phrase says
+        # "of the returned label(s)", so it has to be counted on them.
+        excipient_unchecked = 0
+        if excipient_dropped:
+            returned_rows = out.get("results")
+            if isinstance(returned_rows, list):
+                excipient_unchecked = sum(
+                    1 for r in returned_rows if not _returned_row_identity_text(r)
+                )
+        if excipient_dropped and excipient_unchecked:
+            parts.append(
+                f"{excipient_unchecked} of the {len(out.get('results') or [])} "
+                f"returned label(s) carry an "
+                f"empty/unresolved openFDA name block, so the check above "
+                f"could NOT be applied to them: they are kept because an "
+                f"unresolved block is also how genuine products of "
+                f"'{excipient_term}' appear, but a kept row may still be an "
+                f"unrelated product that merely lists '{excipient_term}' among "
+                f"its ingredients. Read {route} on each such "
+                f"row before treating it as data about '{excipient_term}'."
+            )
+        # Fix-R44: disclose an `_exists_` guard that is a plumbing artifact
+        # rather than a semantic filter.
+        #
+        # `exists` defaults to the tool's RETURN fields. For a section tool that
+        # is exactly right -- you asked for `pharmacokinetics`, and a label
+        # without one has nothing to give you. For the tools whose return fields
+        # are the openFDA identity block, it is not: those labels DO match the
+        # caller's search, they merely lack a resolved `openfda` block, and they
+        # are removed with nothing said. `meta.total` is documented as openFDA's
+        # upstream hit count, which makes the omission invisible -- the guard is
+        # applied server-side, so the reduced number arrives already looking
+        # like the total.
+        #
+        # Measured live 2026-08-12 (`search=...&limit=1`, `meta.results.total`):
+        #   boxed_warning:"torsades de pointes"                    273 -> 104
+        #   adverse_reactions:"keratoacanthoma"                      4 ->   2
+        # The keratoacanthoma case is the one that shows why it matters: the two
+        # dropped labels are not duplicates of the two kept BRAF inhibitors, one
+        # is muromonab-CD3, a different drug class entirely.
+        #
+        # Gated to identity-only guards so the section tools, where the guard is
+        # the right behaviour, stay quiet.
+        # `exists` was already normalized to a list above, and
+        # `section_exists_clause` records whether the guard was actually
+        # appended -- it stays empty when `exist_option` is neither AND nor OR,
+        # where claiming a restriction would describe a clause that never ran.
+        guard_fields = exists or []
+        if (
+            section_exists_clause
+            and guard_fields
+            and all(f.startswith("openfda.") for f in guard_fields)
+        ):
+            parts.append(
+                f"Results are restricted to labels carrying at least one of "
+                f"{', '.join(guard_fields)}, because this tool reports those "
+                f"fields. Labels that match your search but whose openFDA name "
+                f"block is unresolved are excluded, and meta.total is the count "
+                f"AFTER that restriction -- so it is not the number of labels "
+                f"matching your search terms alone. The excluded labels are "
+                f"real products, not duplicates. To see the unrestricted count, "
+                f"query openFDA directly without the _exists_ clause, or use a "
+                f"tool that returns the label section itself."
+            )
+        if parts:
+            out["note"] = " ".join(parts)
+        return out
+
     if isinstance(response_data, dict) and "error" in response_data:
         # When no results are found, return a helpful suggestion instead of None.
         err = response_data.get("error") if isinstance(response_data, dict) else None
@@ -1002,9 +1523,22 @@ def search_openfda(
             name_based = bool(
                 {"openfda.brand_name", "openfda.generic_name"} & orig_fields_flat
             )
+            # Fix-R44: the first RETURN field was taken to be the label section
+            # that came up empty. That holds for the section-retrieval tools
+            # (return_fields ["pharmacokinetics"]) but not for the tools that
+            # return a drug's identity: FDA_get_drug_names_by_boxed_warning
+            # returns ["openfda.brand_name", "openfda.generic_name"] and
+            # SEARCHES `boxed_warning`, so a miss was explained as
+            # "This label section ('openfda.brand_name') is absent from most FDA
+            # labels" -- naming a field the caller never asked about, and one
+            # that is an identity field present on most labels rather than a
+            # section at all. `openfda.*` entries are excluded so the message
+            # falls through to naming what was actually searched.
             section = None
             if isinstance(requested_return_fields, list) and requested_return_fields:
-                section = requested_return_fields[0]
+                candidate = requested_return_fields[0]
+                if isinstance(candidate, str) and not candidate.startswith("openfda."):
+                    section = candidate
 
             # Re-run the caller's own query with the `_exists_:<section>` guard
             # removed. A hit means the drug name was never the problem -- the
@@ -1012,6 +1546,7 @@ def search_openfda(
             # advice would send the reader to fix something that is not broken.
             section_hits = 0
             sections_present = []
+            probe = None
             if section and section_exists_clause:
                 probe = _run_search(
                     params["search"].replace(section_exists_clause, ""),
@@ -1032,6 +1567,12 @@ def search_openfda(
                             if row.get(key) and key not in sections_present:
                                 sections_present.append(key)
 
+            # Hand over the corresponding sections the probe already fetched,
+            # rather than an empty result a caller rarely recovers from.
+            redirected = _redirect_to_neighbour_sections(section, probe, params)
+            if redirected:
+                return redirected
+
             suggestion = _build_not_found_suggestion(
                 query_text=query_text,
                 section=section,
@@ -1039,21 +1580,48 @@ def search_openfda(
                 sections_present=sections_present,
                 is_abbrev_like=is_abbrev_like,
                 name_based=name_based,
+                searched_fields=sorted(orig_fields_flat),
             )
-            return {
-                "status": "error",
-                "error": err,
-                "suggestion": suggestion,
-                "meta": {
-                    "skip": params.get("skip", 0) or 0,
-                    "limit": params.get("limit", 0) or 0,
-                    "total": 0,
-                },
-                "results": [],
-                "result_count": 0,
-                "duplicates_removed": 0,
-            }
-        return None
+        # Fix-47-1: every openFDA error *other* than NOT_FOUND used to fall
+        # off the end of this branch as a bare `None`, which the CLI renders
+        # as `{"result": null}`. On the 157 tools that reach openFDA through
+        # this function that is not a harmless empty answer -- it is a
+        # clinical claim manufactured from a transport failure. Confirmed
+        # live against api.fda.gov/drug/label.json on 2026-08-13: adding one
+        # undeclared query parameter to an otherwise correct tramadol search
+        # is answered by openFDA with HTTP 400
+        # `{"error":{"code":"BAD_REQUEST","message":"Invalid parameter:
+        # section"}}`, and
+        # `FDA_get_boxed_warning_info_by_drug_name {"drug_name":"tramadol",
+        # "section":"boxed"}` returned `{"result": null}` -- indistinguishable
+        # from "tramadol has no boxed warning", for a drug whose label carries
+        # one. openFDA reports BAD_REQUEST, OVER_RATE_LIMIT (its anonymous
+        # tier is ~40 req/min, so a busy session hits this routinely),
+        # SERVER_ERROR and API_KEY_INVALID the same way, so all of them were
+        # being converted into the same false negative.
+        #
+        # The upstream error is reported instead, in the same shape the
+        # NOT_FOUND branch above already returns -- one shared envelope below,
+        # so the two cannot drift apart -- and callers that read
+        # `status`/`results`/`meta` keep working while a null section can no
+        # longer be confused with a failed request. `results` stays empty and
+        # `total` stays 0 rather than being omitted: a consumer that indexes
+        # into them gets an empty set, not a KeyError.
+        else:
+            suggestion = _build_request_error_suggestion(err)
+        return {
+            "status": "error",
+            "error": err,
+            "suggestion": suggestion,
+            "meta": {
+                "skip": params.get("skip", 0) or 0,
+                "limit": params.get("limit", 0) or 0,
+                "total": 0,
+            },
+            "results": [],
+            "result_count": 0,
+            "duplicates_removed": 0,
+        }
 
     # Extract meta information
     meta_info = response_data.get("meta", {})
@@ -1074,26 +1642,33 @@ def search_openfda(
     # Extract results and return only the specified return fields
     results = response_data.get("results", [])
     if return_fields == "ALL":
-        out = {
-            "meta": meta_info,
-            "results": results,
-            "result_count": len(results),
-            "duplicates_removed": 0,
-        }
-        if fallback_note:
-            out["note"] = fallback_note
-        return out
+        # Whole labels skip the projection below, and with it the cut back to
+        # the caller's limit, so a fallback's larger candidate page (at least
+        # 25) came back in full while `meta.limit` above said otherwise.
+        try:
+            caller_limit = int(params.get("limit") or 0)
+        except (TypeError, ValueError):
+            caller_limit = 0
+        if caller_limit > 0:
+            results = results[:caller_limit]
+        return _attach_notes(
+            {
+                "meta": meta_info,
+                "results": results,
+                "result_count": len(results),
+                "duplicates_removed": 0,
+            }
+        )
     # If count parameter is used, return results directly (count API format)
     if params.get("count") or count:
-        out = {
-            "meta": meta_info,
-            "results": results,
-            "result_count": len(results),
-            "duplicates_removed": 0,
-        }
-        if fallback_note:
-            out["note"] = fallback_note
-        return out
+        return _attach_notes(
+            {
+                "meta": meta_info,
+                "results": results,
+                "result_count": len(results),
+                "duplicates_removed": 0,
+            }
+        )
     flat_keys = []
     # Use original search_fields for consistent output schema even when we fell
     # back to broad text search.
@@ -1124,6 +1699,13 @@ def search_openfda(
         and "spl_product_data_elements" not in required_fields
     ):
         identity_fields.append("spl_product_data_elements")
+    # The route travels with every label as identity, so a caller can tell an
+    # oral label from an injectable one, and the default label window can say
+    # which routes the labels it left out cover.
+    if any(
+        x in {"openfda.brand_name", "openfda.generic_name"} for x in required_fields
+    ):
+        identity_fields.append("openfda.route")
     # PLR-vs-legacy sibling annotation. Only armed when the tool actually asks
     # for one of the interchangeable safety sections, so no other FDADrugLabel
     # tool changes shape.
@@ -1234,18 +1816,34 @@ def search_openfda(
         if user_limit_final:
             extracted_results = extracted_results[:user_limit_final]
 
-    out = {
-        "meta": meta_info,
-        "results": extracted_results,
-        "result_count": len(extracted_results),
-        "duplicates_removed": duplicates_removed,
-    }
-    if fallback_note:
-        out["note"] = fallback_note
+    out = _attach_notes(
+        {
+            "meta": meta_info,
+            "results": extracted_results,
+            "result_count": len(extracted_results),
+            "duplicates_removed": duplicates_removed,
+        }
+    )
     if deduplicated:
+        # Two caveats in one payload must not contradict each other. When the
+        # excipient guard has already rewritten `meta.total`, calling it "the
+        # upstream hit count before local processing" is false -- and it is
+        # false in exactly the payload that also carries the guard's own note
+        # saying the number WAS changed. Say which of the two it is.
+        if excipient_dropped and excipient_total_corrected is not None:
+            total_clause = (
+                f"meta.total ({meta_info.get('total')}) is openFDA's hit count "
+                f"ALREADY reduced by the {excipient_dropped} excipient-only "
+                f"row(s) described in 'note' above -- it is not the raw upstream "
+                f"count (openFDA reported {excipient_total_upstream}); "
+            )
+        else:
+            total_clause = (
+                f"meta.total ({meta_info.get('total')}) is openFDA's upstream hit "
+                f"count before local processing; "
+            )
         out["dedup_note"] = (
-            f"meta.total ({meta_info.get('total')}) is openFDA's upstream hit "
-            f"count before local processing; 'results' holds {len(extracted_results)} "
+            f"{total_clause}'results' holds {len(extracted_results)} "
             f"row(s) after {duplicates_removed} byte-identical duplicate label(s) "
             f"were dropped and the caller's limit was applied. Deduplication runs "
             f"per request on the records fetched for that request, so paging with "
@@ -1268,6 +1866,257 @@ def _tools_for_sections(sections):
     return tools
 
 
+def _build_request_error_suggestion(err):
+    """Explain an openFDA failure that is not a NOT_FOUND, and say what to do.
+
+    The point of the message is to make it impossible to read the failure as
+    an answer about the drug, so each branch says explicitly that nothing was
+    learned about the drug, then names the concrete next step.
+    """
+    err = err if isinstance(err, dict) else {}
+    code = err.get("code")
+    message = err.get("message") or "openFDA returned an error."
+
+    if code == "BAD_REQUEST":
+        # openFDA already names the offending key verbatim in `message`
+        # ("Invalid parameter: section"), and that name is the whole
+        # diagnosis, so quoting it is enough. An earlier draft also listed the
+        # parameters that WERE accepted, which actively misled: by this point
+        # `params` holds openFDA's own transport keys (limit/skip/sort/count,
+        # supplied by the tool rather than by the caller), so the list named
+        # things the caller had never sent.
+        return (
+            f"openFDA rejected the request: {message}. An unrecognized query "
+            "parameter is sent to openFDA verbatim and fails the whole "
+            "request, so this is a problem with the call, NOT a statement "
+            "about the drug -- nothing was retrieved, and no conclusion about "
+            "the drug's label may be drawn from it. Re-run without the "
+            "rejected parameter."
+        )
+    if code == "OVER_RATE_LIMIT":
+        return (
+            f"openFDA rate-limited the request: {message}. openFDA's anonymous "
+            "tier allows roughly 40 requests/minute; this request was refused "
+            "before reaching the data, so nothing is known about the drug. "
+            "Retry after a pause, or set FDA_API_KEY (see "
+            "https://open.fda.gov/apis/authentication/) to raise the limit."
+        )
+    return (
+        f"openFDA returned an error ({code or 'unknown'}): {message}. The "
+        "request failed, so this result says nothing about the drug or the "
+        "label section requested. Retry; if it persists, check "
+        "https://open.fda.gov/ for service status."
+    )
+
+
+# For each section a tool reads, the sections that hold the same kind of content
+# on the OTHER label format, most relevant first. openFDA files content by label
+# format (PLR versus legacy/OTC), not by drug, so a tool that reads one section
+# finds nothing on a label written in the other format: `teratogenic_effects`
+# and `risks` are legacy/OTC fields, while a PLR label keeps that content in
+# `pregnancy`, `use_in_specific_populations` and `warnings_and_cautions`.
+# Ordered by relevance on purpose -- an alphabetical cut would put `abuse` and
+# `animal_pharmacology_and_or_toxicology` ahead of `warnings_and_cautions`.
+NEIGHBOUR_SECTIONS = {
+    "risks": [
+        "warnings_and_cautions",
+        "warnings",
+        "boxed_warning",
+        "use_in_specific_populations",
+        "pregnancy",
+        "nursing_mothers",
+    ],
+    "summary_of_safety_and_effectiveness": [
+        "warnings_and_cautions",
+        "warnings",
+        "boxed_warning",
+        "adverse_reactions",
+        "indications_and_usage",
+    ],
+    "when_using": [
+        "warnings_and_cautions",
+        "warnings",
+        "precautions",
+        "do_not_use",
+        "adverse_reactions",
+    ],
+    "instructions_for_use": [
+        "dosage_and_administration",
+        "information_for_patients",
+        "how_supplied",
+        "dosage_forms_and_strengths",
+    ],
+    "ask_doctor": [
+        "warnings_and_cautions",
+        "precautions",
+        "contraindications",
+        "drug_interactions",
+        "warnings",
+    ],
+    "ask_doctor_or_pharmacist": [
+        "drug_interactions",
+        "warnings_and_cautions",
+        "precautions",
+        "warnings",
+    ],
+    "teratogenic_effects": [
+        "pregnancy",
+        "use_in_specific_populations",
+        "pregnancy_or_breast_feeding",
+        "warnings_and_cautions",
+    ],
+    "nonteratogenic_effects": [
+        "pregnancy",
+        "use_in_specific_populations",
+        "pregnancy_or_breast_feeding",
+    ],
+    "pregnancy_or_breast_feeding": [
+        "pregnancy",
+        "nursing_mothers",
+        "use_in_specific_populations",
+        "teratogenic_effects",
+    ],
+    "pregnancy": [
+        "use_in_specific_populations",
+        "pregnancy_or_breast_feeding",
+        "teratogenic_effects",
+        "nursing_mothers",
+    ],
+    "nursing_mothers": [
+        "use_in_specific_populations",
+        "pregnancy_or_breast_feeding",
+        "pregnancy",
+    ],
+    "pediatric_use": [
+        "use_in_specific_populations",
+        "dosage_and_administration",
+        "warnings_and_cautions",
+        "keep_out_of_reach_of_children",
+    ],
+    "geriatric_use": [
+        "use_in_specific_populations",
+        "dosage_and_administration",
+        "clinical_pharmacology",
+    ],
+    "use_in_specific_populations": [
+        "pregnancy",
+        "nursing_mothers",
+        "pediatric_use",
+        "geriatric_use",
+        "pregnancy_or_breast_feeding",
+    ],
+    "pharmacokinetics": [
+        "clinical_pharmacology",
+        "drug_interactions",
+        "use_in_specific_populations",
+    ],
+    "stop_use": [
+        "warnings_and_cautions",
+        "warnings",
+        "adverse_reactions",
+        "precautions",
+    ],
+    "laboratory_tests": [
+        "warnings_and_cautions",
+        "precautions",
+        "clinical_pharmacology",
+        "drug_and_or_laboratory_test_interactions",
+    ],
+    "drug_and_or_laboratory_test_interactions": [
+        "drug_interactions",
+        "precautions",
+        "laboratory_tests",
+        "clinical_pharmacology",
+    ],
+    "spl_medguide": [
+        "information_for_patients",
+        "dosage_and_administration",
+        "warnings_and_cautions",
+    ],
+    "patient_medication_information": [
+        "information_for_patients",
+        "spl_medguide",
+        "dosage_and_administration",
+    ],
+    "dosage_forms_and_strengths": [
+        "how_supplied",
+        "dosage_and_administration",
+        "description",
+    ],
+    "purpose": ["indications_and_usage"],
+    "references": ["clinical_studies"],
+}
+
+
+def _redirect_to_neighbour_sections(section, probe, params):
+    """Return the same label's corresponding sections instead of an empty result.
+
+    `probe` is the query the NOT_FOUND branch already ran with the
+    `_exists_:<section>` guard removed, so it holds the drug's full label records
+    and this costs no extra request. Only sections that are present and
+    non-empty on those records are returned, under their own names; nothing is
+    relabelled as the requested section. Returns None to fall back to the
+    existing NOT_FOUND response whenever there is nothing to hand over, and
+    never raises -- it may only add content, never break a call.
+    """
+    try:
+        neighbours = NEIGHBOUR_SECTIONS.get(section)
+        if not neighbours or not isinstance(probe, dict) or probe.get("error"):
+            return None
+        rows = probe.get("results")
+        if not isinstance(rows, list):
+            return None
+        try:
+            limit = int(params.get("limit") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        records, returned = [], []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = {key: row[key] for key in neighbours if row.get(key)}
+            if not content:
+                continue
+            for key in neighbours:
+                if key in content and key not in returned:
+                    returned.append(key)
+            openfda = row.get("openfda") if isinstance(row.get("openfda"), dict) else {}
+            content["openfda.brand_name"] = openfda.get("brand_name")
+            content["openfda.generic_name"] = openfda.get("generic_name")
+            content["openfda.route"] = openfda.get("route")
+            records.append(content)
+        if not records:
+            return None
+        if limit > 0:
+            records = records[:limit]
+        return {
+            "status": "redirected",
+            "requested_section": section,
+            "returned_sections": returned,
+            "meta": {
+                "skip": params.get("skip", 0) or 0,
+                "limit": params.get("limit", 0) or 0,
+                "total": len(records),
+            },
+            "results": records,
+            "result_count": len(records),
+            "duplicates_removed": 0,
+            "note": (
+                f"This drug's label has no '{section}' section. openFDA files this kind "
+                f"of content under different section names depending on the label's "
+                f"FORMAT (PLR versus legacy/OTC), not the drug, so the empty result was "
+                f"not evidence that the information is missing. Returned instead: the "
+                f"sections of the same label that hold that kind of content -- "
+                f"{', '.join(returned)}. These are NOT the '{section}' section; they are "
+                f"the label's own text under their own names. Check the brand, generic "
+                f"name and route on each record before relying on it, and judge whether "
+                f"it answers the question."
+            ),
+        }
+    except Exception:
+        return None
+
+
 def _build_not_found_suggestion(
     query_text,
     section,
@@ -1275,6 +2124,7 @@ def _build_not_found_suggestion(
     sections_present,
     is_abbrev_like,
     name_based,
+    searched_fields=(),
 ):
     """Advise the caller after a NOT_FOUND, based on WHY it was empty.
 
@@ -1344,9 +2194,50 @@ def _build_not_found_suggestion(
                 f"FDA_get_warnings_by_drug_name."
             )
         parts.append(hint)
-    parts.append(
-        "As a fallback, try searching label text fields (e.g., spl_product_data_elements) and then pivot to the desired section."
-    )
+    # Fix-R44: when the empty result came from a TEXT search rather than a name
+    # lookup, the thing most likely to be wrong is neither spelling nor a
+    # missing section -- it is that openFDA matches a quoted string as a
+    # CONTIGUOUS PHRASE. Measured live 2026-08-12 on `boxed_warning`:
+    # "QT prolongation torsades de pointes" returns 4 labels and methadone is
+    # not among them, while the exact phrase "torsades de pointes" returns 104
+    # and methadone's boxed warning -- which carries both concepts, worded
+    # differently -- is there. A caller who assembles keywords gets a small,
+    # confident-looking total and concludes the drug has no such warning.
+    text_fields = [f for f in searched_fields if not f.startswith("openfda.")]
+    if text_fields and not name_based:
+        # Each searched field is matched against its OWN value, so the message
+        # names the fields but does not attach one caller-supplied string to all
+        # of them -- with warning_text="torsades de pointes" and
+        # indication="Hypertension" that read as though both fields were being
+        # searched for the first value.
+        parts.append(
+            f"Note that each text field searched here "
+            f"({', '.join(text_fields)}) is matched against its value as a "
+            "CONTIGUOUS PHRASE, not as a set of keywords: a value matches only "
+            "labels containing those words adjacently and in that order, so "
+            "every extra word can only shrink the result. Search one short "
+            "exact phrase that would really appear in the text (e.g. 'torsades "
+            "de pointes' rather than an assembled description), supply only the "
+            "fields you need, and run several narrow searches instead of one "
+            "broad one."
+        )
+
+    # The blanket "fall back to spl_product_data_elements" advice used to be
+    # appended here unconditionally. That field is the raw product/ingredient
+    # blob, so it matches EXCIPIENTS: searching it for "propylene glycol"
+    # returns 8,346 labels whose top hits are rabeprazole, glipizide and urea --
+    # a different entity's data, with openfda.brand_name and generic_name null
+    # on every row so the substitution is undetectable. Recommending it in an
+    # error message pointed callers straight at that failure, so the caveat now
+    # travels with the advice.
+    if name_based:
+        parts.append(
+            "As a last resort the raw text field spl_product_data_elements can "
+            "be searched, but it is the product/ingredient blob: it matches "
+            "products that merely CONTAIN the substance as an inactive "
+            "ingredient, and those rows carry no openfda.generic_name to warn "
+            "you. Check openfda.generic_name on every row before using it."
+        )
     return " ".join(parts)
 
 
@@ -1390,6 +2281,82 @@ def _build_section_note(sibling_map, extracted_results):
     )
 
 
+# Without a caller limit a label tool fetches up to 100 labels, most of them the
+# same drug from other manufacturers; for ibuprofen that is 100 labels and over
+# half a million characters from one call. The caller now sees the first
+# DEFAULT_LABEL_WINDOW labels (openFDA's order, as before) and an inventory of
+# every label that matched, so another route or formulation is one call away.
+DEFAULT_LABEL_WINDOW = 8
+
+
+def _label_route(row):
+    route = row.get("openfda.route")
+    if isinstance(route, list) and route:
+        return "/".join(str(r) for r in route)
+    return "not stated"
+
+
+def _label_names(row):
+    parts = []
+    for key in ("openfda.generic_name", "openfda.brand_name"):
+        value = row.get(key)
+        parts.append(
+            " ".join(str(v) for v in value)
+            if isinstance(value, list)
+            else str(value or "")
+        )
+    return " ".join(parts).lower()
+
+
+def _default_label_window(result, arguments, window=DEFAULT_LABEL_WINDOW):
+    """Show the first ``window`` labels when the caller gave no limit, and say what else matched.
+
+    Never raises and never adds a label: it can only shorten the list, and the
+    inventory it attaches counts every label that matched.
+    """
+    try:
+        if not isinstance(arguments, dict) or arguments.get("limit") is not None:
+            return result
+        if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+            return result
+        rows = result["results"]
+        if len(rows) <= window:
+            return result
+        labels = [r for r in rows if isinstance(r, dict)]
+        routes = {}
+        for r in labels:
+            routes[_label_route(r)] = routes.get(_label_route(r), 0) + 1
+        routes = dict(sorted(routes.items(), key=lambda kv: (-kv[1], kv[0])))
+        combination = sum(
+            " and " in _label_names(r) or "/" in _label_names(r) for r in labels
+        )
+        no_identity = sum(not _label_names(r).strip() for r in labels)
+        out = dict(result)
+        out["results"] = rows[:window]
+        out["result_count"] = window
+        out["label_inventory"] = {
+            "labels_matched": len(rows),
+            "labels_shown": window,
+            "routes_of_all_matched_labels": routes,
+            "routes_of_shown_labels": sorted(
+                {_label_route(r) for r in rows[:window] if isinstance(r, dict)}
+            ),
+            "combination_products_matched": combination,
+            "labels_without_product_identity": no_identity,
+        }
+        out["label_window_note"] = (
+            f"Showing the first {window} of {len(rows)} labels that matched; most matched labels are the "
+            "same drug from other manufacturers. Routes among all matched labels: "
+            + ", ".join(f"{k} {v}" for k, v in routes.items())
+            + f". {combination} are combination products and {no_identity} carry no product identity. "
+            "To see other labels, for example another route or formulation, call again with limit "
+            "(up to 100) and skip."
+        )
+        return out
+    except Exception:
+        return result
+
+
 @register_tool("FDATool")
 class FDATool(BaseTool):
     def __init__(self, tool_config, endpoint_url, api_key=None):
@@ -1401,7 +2368,16 @@ class FDATool(BaseTool):
         if self.exists is None:
             self.exists = self.return_fields
         self.endpoint_url = endpoint_url
-        self.api_key = api_key or os.getenv("FDA_API_KEY")
+        self._explicit_api_key = api_key
+
+    @property
+    def api_key(self):
+        return self.credential("FDA_API_KEY") or self._explicit_api_key
+
+    @api_key.setter
+    def api_key(self, value):
+        # Keep direct assignment working for callers that configure a key in code.
+        self._explicit_api_key = value
 
     def run(self, arguments):
         arguments = copy.deepcopy(arguments)
@@ -1419,6 +2395,161 @@ class FDATool(BaseTool):
             return_fields=self.return_fields,
             exist_option="OR",
         )
+
+
+# Dosage-form and formulation words callers often attach to a drug name
+# ("verapamil SR", "cyanocobalamin nasal spray", "dalfampridine extended-release").
+# openFDA matches on product names, so such a name can miss every label. Longest
+# first, so "nasal spray" is removed before "spray" would strand "nasal". These
+# are generic words, never drug names: no brand-to-generic mapping is added.
+_NAME_FORM_WORDS = sorted(
+    {
+        "extended-release",
+        "extended release",
+        "delayed-release",
+        "delayed release",
+        "orally disintegrating",
+        "ophthalmic solution",
+        "ophthalmic suspension",
+        "oral solution",
+        "oral suspension",
+        "nasal spray",
+        "vaginal cream",
+        "rectal foam",
+        "topical cream",
+        "eye drops",
+        "ear drops",
+        "for injection",
+        "injection",
+        "infusion",
+        "tablets",
+        "tablet",
+        "capsules",
+        "capsule",
+        "cream",
+        "ointment",
+        "gel",
+        "foam",
+        "patch",
+        "spray",
+        "drops",
+        "solution",
+        "suspension",
+        "lotion",
+        "powder",
+        "syrup",
+        "elixir",
+        "inhaler",
+        "inhalation",
+        "film",
+        "nasal",
+        "vaginal",
+        "rectal",
+        "ophthalmic",
+        "topical",
+        "oral",
+        "transdermal",
+    },
+    key=len,
+    reverse=True,
+)
+_NAME_FORM_ABBREVIATIONS = ("sr", "er", "xr", "xl", "cr", "dr", "la", "odt", "ir")
+
+
+def _strip_form_words(text):
+    previous = None
+    while text != previous:
+        previous = text
+        text = re.sub(
+            r"\s+\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|%|units?|iu)(?:/\S+)?\s*$",
+            "",
+            text,
+            flags=re.I,
+        )
+        for word in _NAME_FORM_WORDS:
+            text = re.sub(r"[\s-]+" + re.escape(word) + r"$", "", text, flags=re.I)
+        text = re.sub(
+            r"\s+(?:" + "|".join(_NAME_FORM_ABBREVIATIONS) + r")\.?$",
+            "",
+            text,
+            flags=re.I,
+        )
+        text = text.strip(" ,-")
+    return text
+
+
+def _drug_name_candidates(name):
+    """Shorter names to retry after a NOT_FOUND, most specific first.
+
+    "BETHKIS (tobramycin)" -> ["BETHKIS", "tobramycin"]; "verapamil SR" ->
+    ["verapamil"]. A name that yields nothing shorter returns an empty list, so
+    a supplement or a drug class is never turned into a guessed product.
+    """
+    original = re.sub(r"\s+", " ", name).strip()
+    bases = [original]
+    bracket = re.match(r"^(.*?)\s*\(([^()]+)\)\s*$", original)
+    if bracket:
+        bases = [bracket.group(1), bracket.group(2)]
+    out = []
+    for base in bases:
+        for candidate in (_strip_form_words(base), base.strip(" ,-")):
+            if (
+                len(candidate) >= 3
+                and candidate.lower() != original.lower()
+                and candidate.lower() not in [c.lower() for c in out]
+            ):
+                out.append(candidate)
+    return out
+
+
+def _is_not_found(result):
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            return False
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("error"), dict)
+        and result["error"].get("code") == "NOT_FOUND"
+    )
+
+
+def _retry_with_normalised_names(result, arguments, run, max_retries=3):
+    """After a NOT_FOUND, retry the same call with a shorter drug name.
+
+    Only a NOT_FOUND is retried; any other outcome, including an error, is
+    returned untouched. The first retry that finds a label wins, and says
+    which name was searched, because a shorter name can match other forms of
+    the same drug. Never raises: it may only add a result, never lose one.
+    """
+    try:
+        if not _is_not_found(result):
+            return result
+        name = arguments.get("drug_name")
+        if not isinstance(name, str) or not name.strip():
+            return result
+        for candidate in _drug_name_candidates(name)[:max_retries]:
+            retry = run(dict(arguments, drug_name=candidate))
+            if not isinstance(retry, dict) or _is_not_found(retry):
+                continue
+            if retry.get("error") and not retry.get("results"):
+                continue
+            retry = dict(retry)
+            retry["name_normalised_from"] = name
+            retry["name_searched_as"] = candidate
+            note = (
+                f"No label matched the name '{name}'. Matched after shortening it "
+                f"(dropping a bracketed second name or dosage-form and strength "
+                f"words): searched as '{candidate}'. The results can therefore "
+                f"include other forms or formulations of the same drug -- check the "
+                f"route and dosage form on each record before relying on it."
+            )
+            retry["note"] = (retry["note"] + " " + note) if retry.get("note") else note
+            return retry
+        return result
+    except Exception:
+        return result
 
 
 @register_tool("FDADrugLabel")
@@ -1512,8 +2643,16 @@ class FDADrugLabelTool(FDATool):
                 # Not a ChEMBL ID, use original value (strip whitespace)
                 arguments["drug_name"] = drug_name
 
-        # Call parent run method
-        return super().run(arguments)
+        # Call parent run method. A NOT_FOUND caused only by dosage-form words or
+        # a bracketed second name is retried with the shorter name (#660), and
+        # the window is applied to whatever that finally returns -- so a caller
+        # who gave no limit gets the first labels plus an inventory of the rest
+        # whether the match came from their spelling or from the retry.
+        run_parent = super().run
+        result = _retry_with_normalised_names(
+            run_parent(arguments), arguments, run_parent
+        )
+        return _default_label_window(result, arguments)
 
 
 @register_tool("FDADrugLabelSearchTool")
@@ -1843,7 +2982,16 @@ class FDADrugLabelFieldValueTool(BaseTool):
     def __init__(self, tool_config, api_key=None):
         super().__init__(tool_config)
         self.endpoint_url = "https://api.fda.gov/drug/label.json"
-        self.api_key = api_key or os.getenv("FDA_API_KEY")
+        self._explicit_api_key = api_key
+
+    @property
+    def api_key(self):
+        return self.credential("FDA_API_KEY") or self._explicit_api_key
+
+    @api_key.setter
+    def api_key(self, value):
+        # Keep direct assignment working for callers that configure a key in code.
+        self._explicit_api_key = value
 
     def run(self, arguments):
         arguments = copy.deepcopy(arguments)
@@ -2346,8 +3494,10 @@ class FDADrugLabelGetDrugNamesByIndicationStats(FDADrugLabelTool):
 class OpenFDADrugEventsTool(BaseRESTTool):
     """OpenFDA drug adverse event search with convenience parameters.
 
-    Accepts either a raw Lucene 'search' string or the convenience parameters
-    'drug_name' and 'reaction' (which are assembled into a Lucene query).
+    Accepts a raw Lucene 'search' string, the convenience parameters
+    'drug_name' and 'reaction' (which are assembled into a Lucene query), or
+    ANY COMBINATION of the three: whichever are supplied are AND-ed together,
+    so a raw clause narrows a named drug rather than replacing it.
 
     Note: MedDRA terms in FAERS use British English spelling (e.g.
     'haemorrhage' not 'hemorrhage', 'haematoma' not 'hematoma').
@@ -2364,18 +3514,22 @@ class OpenFDADrugEventsTool(BaseRESTTool):
         # Strip params unknown to openFDA to avoid HTTP 400 "Invalid parameter".
         args = {k: v for k, v in args.items() if k in self._VALID_API_PARAMS}
 
-        # Build Lucene query from convenience params when
-        # 'search' is not provided directly.
-        if not args.get("search"):
-            if not drug_name:
-                return {
-                    "status": "error",
-                    "error": (
-                        "Provide either 'search' (Lucene query) or 'drug_name'. "
-                        "Example: drug_name='warfarin', reaction='haemorrhage'. "
-                        "Note: MedDRA terms use British spelling (haemorrhage, haematoma, etc.)."
-                    ),
-                }
+        # Build the Lucene query from whichever of the three inputs were given.
+        #
+        # 'drug_name'/'reaction' used to be honoured ONLY when 'search' was
+        # absent, and were silently dropped otherwise -- so
+        # {"drug_name": X, "search": "serious:1", "count": <reaction facet>}
+        # counted the WHOLE of FAERS and reported it as X's. Measured
+        # 2026-08-12, that call returned a byte-identical payload topped by
+        # DEATH 846,360 for levetiracetam, for lacosamide and for the
+        # nonexistent drug "ZZZ_NOT_A_DRUG_XYZ", every one of them
+        # "status": "success". The drug-name-only path answers SEIZURE 16,336
+        # for levetiracetam, so the data was never the problem.
+        #
+        # AND-ing can only narrow the result set, never widen it, so no caller
+        # can lose reports that were genuinely theirs.
+        parts = []
+        if drug_name:
             # Shared with the FAERS_* count/detail/analytics tools so this tool
             # cannot disagree with them about how many reports name a drug --
             # see FAERS_DRUG_NAME_FIELDS for the measurements.
@@ -2384,10 +3538,27 @@ class OpenFDADrugEventsTool(BaseRESTTool):
             # finished query to requests as a `params` value, and a literal "+"
             # there is percent-encoded to %2B and reaches openFDA as a plus sign
             # instead of a separator. That is also why the AND below is " AND ".
-            parts = [faers_drug_name_clause(drug_name, joiner=" OR ")]
-            if reaction:
-                parts.append(f'patient.reaction.reactionmeddrapt:"{reaction}"')
-            args["search"] = " AND ".join(parts)
+            parts.append(faers_drug_name_clause(drug_name, joiner=" OR "))
+        if reaction:
+            parts.append(f'patient.reaction.reactionmeddrapt:"{reaction}"')
+        raw_search = args.get("search")
+        if raw_search:
+            # Parenthesized only when it is about to be AND-ed with something:
+            # the caller's clause may contain a top-level OR, and Lucene binds
+            # AND tighter than OR -- the same trap _render_field_group
+            # documents for the multi-field name group. A raw search on its own
+            # is passed through byte-for-byte as the caller wrote it.
+            parts.append(f"({raw_search})" if parts else raw_search)
+        if not parts:
+            return {
+                "status": "error",
+                "error": (
+                    "Provide either 'search' (Lucene query) or 'drug_name'. "
+                    "Example: drug_name='warfarin', reaction='haemorrhage'. "
+                    "Note: MedDRA terms use British spelling (haemorrhage, haematoma, etc.)."
+                ),
+            }
+        args["search"] = " AND ".join(parts)
 
         result = super().run(args)
         # OpenFDA returns 404 when no records match the query (not a server error).

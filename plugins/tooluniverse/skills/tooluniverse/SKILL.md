@@ -103,6 +103,7 @@ These reminders are for fast pattern recognition during routing. Detailed `❌ W
 
 | Keywords | Action |
 |----------|--------|
+| **A single database-checkable fact**, especially multiple-choice — "which of the following gene/drug/variant/pathway is…", anything phrased "**according to** <database>" (DisGeNet, OMIM, MSigDB, miRDB, GTRD, MGI, Ensembl, ClinVar, ChEMBL, OpenTargets, UniProt). Look it up rather than answering from memory; niche annotations are what gets hallucinated | `Skill(skill="tooluniverse-biomedical-fact-lookup")` |
 | "research", "profile", "**disease**", "syndrome", "disorder", "comprehensive report on [disease]" | `Skill(skill="tooluniverse-disease-research")` |
 | "research", "profile", "**drug**", "medication", "therapeutic agent", "tell me about [drug]" | `Skill(skill="tooluniverse-drug-research")` |
 | "**literature review**", "papers about", "publications on", "research articles", "recent studies" | `Skill(skill="tooluniverse-literature-deep-research")` |
@@ -130,6 +131,7 @@ These reminders are for fast pattern recognition during routing. Detailed `❌ W
 | "**device adverse events**", "device recall", "MAUDE", "food/supplement adverse event", "CAERS", "veterinary adverse event", "drug shortage" | `Skill(skill="tooluniverse-product-safety-surveillance")` |
 | "**variant interpretation**", "VUS", "pathogenicity", "clinical significance", "is [variant] pathogenic" | `Skill(skill="tooluniverse-variant-interpretation")` |
 | "**clinical guidelines**", "practice guidelines", "treatment guidelines", "dosing recommendations", "standard of care" | `Skill(skill="tooluniverse-clinical-guidelines")` |
+| **Drug choice for a described patient** — "which of the following is most appropriate for", "which drug should this patient receive"; a vignette naming a modifier (**hepatic/renal impairment**, Child-Pugh, "on a strong CYP3A4 inhibitor", pregnancy, a contraindication) alongside candidate drugs. The deciding fact is in each candidate's FDA label, not recall | `Skill(skill="tooluniverse-biomedical-fact-lookup")` |
 | "**patient stratification**", "precision medicine", "biomarker stratification", "treatment selection" | `Skill(skill="tooluniverse-precision-medicine-stratification")` |
 
 ### 4. Discovery & Design
@@ -141,6 +143,7 @@ These reminders are for fast pattern recognition during routing. Detailed `❌ W
 | "**drug repurposing**", "new indication", "existing drugs for [disease]", "repurpose [drug]" | `Skill(skill="tooluniverse-drug-repurposing")` |
 | "**drug target validation**", "target druggability", "validate target", "target assessment" | `Skill(skill="tooluniverse-drug-target-validation")` |
 | "**network pharmacology**", "polypharmacology", "compound-target network", "multi-target" | `Skill(skill="tooluniverse-network-pharmacology")` |
+| **Ongoing protein design validation** — "protein design campaign", "validate binder candidates", "conflicting binder models", "conditional pH binder", "glycan clash validation", "protein competition submission" | `Skill(skill="tooluniverse-protein-design-campaign")` |
 | "**design protein**", "protein binder", "de novo protein", "RFdiffusion", "ProteinMPNN" | `Skill(skill="tooluniverse-protein-therapeutic-design")` |
 | "**antibody engineering**", "antibody design", "humanization", "affinity maturation" | `Skill(skill="tooluniverse-antibody-engineering")` |
 | "**ADMET prediction**", "ADME", "absorption", "distribution", "metabolism", "excretion", "toxicity prediction" | `Skill(skill="tooluniverse-admet-prediction")` |
@@ -213,7 +216,7 @@ These reminders are for fast pattern recognition during routing. Detailed `❌ W
 | "**primer design**", "PCR primers", "qPCR primer", "melting temperature", "Tm calculation", "annealing temperature", "GC clamp", "primer-dimer", "oligo analysis", "amplicon", "forward and reverse primer" | `Skill(skill="tooluniverse-primer-design")` |
 | "**diagnostic test**", "sensitivity specificity", "ROC curve", "AUC", "PPV", "NPV", "likelihood ratio", "Youden", "optimal cutoff", "post-test probability", "biomarker accuracy", "confusion matrix" | `Skill(skill="tooluniverse-diagnostic-test-evaluation")` |
 | "**drug synergy**", "drug combination", "Bliss independence", "Loewe additivity", "HSA synergy", "ZIP score", "combination index", "Chou-Talalay", "synergistic antagonistic", "combination therapy analysis" | `Skill(skill="tooluniverse-drug-synergy")` |
-| "**molecular cloning**", "Gibson Assembly", "Golden Gate", "Type IIS", "BsaI", "BbsI", "assembly overlap", "fragment assembly", "construct design", "domestication" | `Skill(skill="tooluniverse-molecular-cloning")` |
+| "**molecular cloning**", "Gibson Assembly", "Golden Gate", "Type IIS", "BsaI", "BbsI", "Esp3I", "BsmBI", "SapI", "assembly overlap", "fragment assembly", "construct design", "domestication", **or the reverse direction** — "I combined these plasmids…", "what does the resulting plasmid express", "what does the gRNA target", "virtual digest", "restriction digest of a plasmid" | `Skill(skill="tooluniverse-molecular-cloning")` |
 | "**metabolomics analysis**", "LC-MS analysis", "metabolite quantification", "metabolic flux" | `Skill(skill="tooluniverse-metabolomics-analysis")` |
 | "**functional genomics screen**", "CRISPR library", "shRNA screen", "barcode screen" | `Skill(skill="tooluniverse-functional-genomics-screens")` |
 | "**proteomics data**", "PRIDE", "MassIVE", "ProteomeXchange", "proteomics dataset" | `Skill(skill="tooluniverse-proteomics-data-retrieval")` |
@@ -287,6 +290,15 @@ These reminders are for fast pattern recognition during routing. Detailed `❌ W
 | "**SDK**", "Python SDK", "build AI scientist", "programmatic access", "**import tooluniverse**", "**coding API**", "**tu build**", "**typed wrappers**" | `Skill(skill="tooluniverse-sdk")` |
 | "**install skills**", "missing skills", "skill not found", "add skills" | `Skill(skill="tooluniverse-install-skills")` |
 | "**self-review**", "eval current work", "evaluate this work", "check my work", "is this complete", "definition of done", "evaluation rubric", "success criteria", "grading criteria", "LLM-as-judge" | `Skill(skill="tooluniverse-self-review")` |
+
+### 13. Sharing & Account Tasks (you do the work; the user only answers and clicks Allow)
+
+| Keywords | Action |
+|----------|--------|
+| "**share my model/script/function**", "let my lab/colleague use this", "make this a tool", "share my GPU", "**keep my tool running**" | `Skill(skill="tooluniverse-share-computer")` |
+| "**publish my tool**", "put it in Discover", "let anyone use my tool", "unpublish" | `Skill(skill="tooluniverse-publish-tool")` |
+| "**API key missing**", "login/token rejected", "add my OMIM/NCBI/DisGeNET key", "which logins do I need" | `Skill(skill="tooluniverse-database-logins")` |
+| "**TU-SHARE-**" code, "use my colleague's model/computer", "run it on the lab GPU", "shared or community tools" | `Skill(skill="tooluniverse-use-shared-computer")` |
 
 ---
 

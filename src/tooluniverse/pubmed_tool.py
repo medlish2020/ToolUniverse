@@ -1,10 +1,9 @@
-import os
-import time
-import threading
 import xml.etree.ElementTree as ET
 from typing import Any, Dict
 from .base_rest_tool import BaseRESTTool
-from .http_utils import request_with_retry
+from .http_utils import redact_url_secrets, request_with_retry
+from .ncbi_eutils_tool import esearch_query_disclosure
+from .provider_rate_limit import enforce_provider_rate_limit
 from .tool_registry import register_tool
 
 
@@ -77,18 +76,18 @@ class PubMedRESTTool(BaseRESTTool):
     - Without API key: 3 requests/second
     - With API key: 10 requests/second
 
-    API key is read from environment variable NCBI_API_KEY.
+    API key is resolved from the active request, with NCBI_API_KEY as the
+    local environment fallback.
     Get your free key at: https://www.ncbi.nlm.nih.gov/account/
     """
 
-    # Class-level rate limiting (shared across all instances)
-    _last_request_time = 0.0
-    _rate_limit_lock = threading.Lock()
-
     def __init__(self, tool_config):
         super().__init__(tool_config)
-        # Get API key from environment as fallback
-        self.default_api_key = os.environ.get("NCBI_API_KEY", "")
+
+    @property
+    def default_api_key(self) -> str:
+        """Resolve the NCBI API key for the active request."""
+        return self.credential("NCBI_API_KEY") or ""
 
     def _get_param_mapping(self) -> Dict[str, str]:
         """Map PubMed E-utilities parameter names."""
@@ -96,28 +95,9 @@ class PubMedRESTTool(BaseRESTTool):
             "limit": "retmax",  # limit -> retmax for E-utilities
         }
 
-    def _enforce_rate_limit(self, has_api_key: bool) -> None:
-        """Enforce NCBI E-utilities rate limits.
-
-        Args:
-            has_api_key: Whether an API key is provided
-        """
-        # Rate limits per NCBI guidelines
-        # https://www.ncbi.nlm.nih.gov/books/NBK25497/#chapter2.Usage_Guidelines_and_Requiremen
-        # Using conservative intervals to avoid rate limit errors:
-        # - Without API key: 3 req/sec -> 0.4s interval (more conservative than 0.33s)
-        # - With API key: 10 req/sec -> 0.15s interval (more conservative than 0.1s)
-        min_interval = 0.15 if has_api_key else 0.4
-
-        with self._rate_limit_lock:
-            current_time = time.time()
-            time_since_last = current_time - PubMedRESTTool._last_request_time
-
-            if time_since_last < min_interval:
-                sleep_time = min_interval - time_since_last
-                time.sleep(sleep_time)
-
-            PubMedRESTTool._last_request_time = time.time()
+    def _enforce_rate_limit(self, api_key: str) -> None:
+        """Enforce NCBI quotas independently for each user credential."""
+        enforce_provider_rate_limit("ncbi", api_key, 10.0 if api_key else 3.0)
 
     def _build_params(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Build E-utilities parameters with special handling."""
@@ -269,7 +249,7 @@ class PubMedRESTTool(BaseRESTTool):
             }
 
         try:
-            has_api_key = bool(self.default_api_key)
+            api_key = self.default_api_key
             base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
             summary_url = f"{base}/esummary.fcgi"
 
@@ -281,14 +261,14 @@ class PubMedRESTTool(BaseRESTTool):
             chunk_size = 100
             for chunk_start in range(0, len(pmid_list), chunk_size):
                 chunk = pmid_list[chunk_start : chunk_start + chunk_size]
-                self._enforce_rate_limit(has_api_key)
+                self._enforce_rate_limit(api_key)
                 params = {
                     "db": "pubmed",
                     "id": ",".join(chunk),
                     "retmode": "json",
                 }
-                if self.default_api_key:
-                    params["api_key"] = self.default_api_key
+                if api_key:
+                    params["api_key"] = api_key
 
                 response = request_with_retry(
                     self.session,
@@ -333,10 +313,10 @@ class PubMedRESTTool(BaseRESTTool):
             # Retry failures one-by-one to isolate transient per-ID issues.
             retry_failed_pmids = []
             for pmid in failed_pmids:
-                self._enforce_rate_limit(has_api_key)
+                self._enforce_rate_limit(api_key)
                 params = {"db": "pubmed", "id": pmid, "retmode": "json"}
-                if self.default_api_key:
-                    params["api_key"] = self.default_api_key
+                if api_key:
+                    params["api_key"] = api_key
 
                 try:
                     response = request_with_retry(
@@ -392,7 +372,11 @@ class PubMedRESTTool(BaseRESTTool):
         try:
             root = ET.fromstring(response.text)
         except ET.ParseError:
-            return {"status": "success", "data": response.text, "url": response.url}
+            return {
+                "status": "success",
+                "data": response.text,
+                "url": redact_url_secrets(response.url),
+            }
 
         def _text(el, path, default=""):
             found = el.find(path) if el is not None else None
@@ -495,7 +479,11 @@ class PubMedRESTTool(BaseRESTTool):
             if a
         ]
         data = articles[0] if len(articles) == 1 else articles
-        result = {"status": "success", "data": data, "url": response.url}
+        result = {
+            "status": "success",
+            "data": data,
+            "url": redact_url_secrets(response.url),
+        }
         if len(articles) != 1:
             result["count"] = len(articles)
         return result
@@ -504,65 +492,28 @@ class PubMedRESTTool(BaseRESTTool):
     def _search_warning_metadata(esearch_result: dict) -> dict:
         """Surface NCBI's own report that it did not run the query as asked.
 
-        esearch silently drops quoted phrases it cannot match and then answers
-        a broader query. NCBI discloses this in ``esearchresult.warninglist``;
-        without propagating it a caller cannot tell that the returned articles
-        answer a different question than the one they submitted.
+        Fix-54A-1: this parsing was PubMed-only, but every eutils database
+        behaves identically -- measured across fourteen of them -- and twelve
+        other modules here parse esearch responses without reading either
+        disclosure container. The logic now lives in one place,
+        :func:`~tooluniverse.ncbi_eutils_tool.esearch_query_disclosure`, which
+        carries the measurements; this method stays as PubMed's entry point.
 
-        Returns an empty dict when NCBI reported no warnings, so unaffected
-        queries keep their existing metadata shape.
+        The sweep is NOT complete. Six modules were wired (medgen, sra,
+        ncbi_sra, ncbi_nucleotide, epigenomics' four GEO searches, and this
+        one). Still unwired, all confirmed to parse ``esearchresult`` and build
+        their own payload, all with a measured database in that table:
+        ``clinvar_tool``, ``dbsnp_tool``, ``pmc_tool``, ``geo_tool``,
+        ``unified_guideline_tools``, ``clinical_society_tools`` and
+        ``icite_tool``. ``pmc_tool`` and ``icite_tool`` return a bare list with
+        nowhere to put the disclosure, so wiring them is a response-shape
+        change rather than an additive one.
+
+        Note this method splats its result flat into ``metadata`` while the six
+        new sites nest it under a ``query_disclosure`` key. One helper, two
+        shapes; unifying them would change PubMed's published response.
         """
-        if not isinstance(esearch_result, dict):
-            return {}
-
-        warning_list = esearch_result.get("warninglist")
-        if not isinstance(warning_list, dict):
-            return {}
-
-        def _as_list(value: Any) -> list:
-            if isinstance(value, str):
-                return [value] if value.strip() else []
-            if isinstance(value, (list, tuple)):
-                return [v for v in value if v]
-            return []
-
-        not_found = _as_list(warning_list.get("quotedphrasesnotfound"))
-        ignored = _as_list(warning_list.get("phrasesignored"))
-        messages = _as_list(warning_list.get("outputmessages"))
-
-        if not (not_found or ignored or messages):
-            return {}
-
-        metadata: dict = {}
-        if not_found:
-            metadata["quoted_phrases_not_found"] = not_found
-        if ignored:
-            metadata["phrases_ignored"] = ignored
-        if messages:
-            metadata["ncbi_messages"] = messages
-
-        translation = esearch_result.get("querytranslation")
-        if isinstance(translation, str) and translation.strip():
-            metadata["executed_query"] = translation.strip()
-
-        # Top-level, unmissable statement of the mismatch for any caller that
-        # reads metadata but not the individual warning keys.
-        notes = []
-        if not_found:
-            notes.append(
-                "PubMed could not match the quoted phrase(s) "
-                f"{not_found}; they were dropped and these results answer a "
-                "BROADER query than the one submitted."
-            )
-        if ignored:
-            notes.append(f"PubMed ignored the phrase(s) {ignored}.")
-        if messages:
-            notes.append("; ".join(str(m) for m in messages))
-        if notes:
-            metadata["query_not_executed_as_submitted"] = True
-            metadata["warning"] = " ".join(notes)
-
-        return metadata
+        return esearch_query_disclosure(esearch_result, source="PubMed")
 
     def _fetch_abstracts(self, pmid_list: list[str]) -> Dict[str, str]:
         """Best-effort abstract fetch via efetch XML for a list of PMIDs."""
@@ -570,19 +521,19 @@ class PubMedRESTTool(BaseRESTTool):
         if not pmids:
             return {}
 
-        has_api_key = bool(self.default_api_key)
+        api_key = self.default_api_key
         base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
         url = f"{base}/efetch.fcgi"
 
         # Batch efetch; keep payload bounded.
-        self._enforce_rate_limit(has_api_key)
+        self._enforce_rate_limit(api_key)
         params: Dict[str, Any] = {
             "db": "pubmed",
             "id": ",".join(pmids[:200]),
             "retmode": "xml",
         }
-        if self.default_api_key:
-            params["api_key"] = self.default_api_key
+        if api_key:
+            params["api_key"] = api_key
 
         resp = request_with_retry(
             self.session,
@@ -627,8 +578,8 @@ class PubMedRESTTool(BaseRESTTool):
         url = None
         try:
             # Enforce rate limiting before making request
-            has_api_key = bool(self.default_api_key)
-            self._enforce_rate_limit(has_api_key)
+            api_key = self.default_api_key
+            self._enforce_rate_limit(api_key)
 
             endpoint = self.tool_config["fields"]["endpoint"]
             params = self._build_params(arguments)
@@ -646,9 +597,9 @@ class PubMedRESTTool(BaseRESTTool):
                 return {
                     "status": "error",
                     "error": "PubMed API error",
-                    "url": response.url,
+                    "url": redact_url_secrets(response.url),
                     "status_code": response.status_code,
-                    "detail": (response.text or "")[:500],
+                    "detail": redact_url_secrets((response.text or "")[:500]),
                 }
 
             # Try JSON first (elink, esearch)
@@ -661,7 +612,7 @@ class PubMedRESTTool(BaseRESTTool):
                     return {
                         "status": "error",
                         "data": f"NCBI API error: {error_msg[:200]}",
-                        "url": response.url,
+                        "url": redact_url_secrets(response.url),
                     }
 
                 # For esearch responses, extract ID list and fetch summaries
@@ -794,7 +745,7 @@ class PubMedRESTTool(BaseRESTTool):
                             "status": "success",
                             "data": [],
                             "count": 0,
-                            "url": response.url,
+                            "url": redact_url_secrets(response.url),
                         }
 
                     if linksets and len(linksets) > 0:
@@ -842,14 +793,14 @@ class PubMedRESTTool(BaseRESTTool):
                                     "status": "success",
                                     "data": links,
                                     "count": len(links),
-                                    "url": response.url,
+                                    "url": redact_url_secrets(response.url),
                                 }
                         # Extract LinkOut URLs (idurllist)
                         elif "idurllist" in linkset:
                             return {
                                 "status": "success",
                                 "data": linkset.get("idurllist", {}),
-                                "url": response.url,
+                                "url": redact_url_secrets(response.url),
                             }
                         else:
                             # Linkset exists but no linksetdbs or idurllist = no results
@@ -857,7 +808,7 @@ class PubMedRESTTool(BaseRESTTool):
                                 "status": "success",
                                 "data": [],
                                 "count": 0,
-                                "url": response.url,
+                                "url": redact_url_secrets(response.url),
                             }
 
                 # For elink responses with LinkOut URLs (llinks returns direct idurllist)
@@ -865,13 +816,13 @@ class PubMedRESTTool(BaseRESTTool):
                     return {
                         "status": "success",
                         "data": data.get("idurllist", []),
-                        "url": response.url,
+                        "url": redact_url_secrets(response.url),
                     }
 
                 return {
                     "status": "success",
                     "data": data,
-                    "url": response.url,
+                    "url": redact_url_secrets(response.url),
                 }
             except Exception:
                 # For XML responses (efetch), parse into structured data
@@ -880,6 +831,6 @@ class PubMedRESTTool(BaseRESTTool):
         except Exception as e:
             return {
                 "status": "error",
-                "error": f"PubMed API error: {str(e)}",
+                "error": redact_url_secrets(f"PubMed API error: {str(e)}"),
                 "url": url,
             }
